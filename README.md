@@ -67,8 +67,8 @@ Arena reduces GC pauses by:
 ### Benchmark (vs. Go heap):
 
 ```
-TestHeapLargeObjects    Heap GC took time: 121.2361ms, living objects: 13108293
-TestArenaLargeObjects   Arena GC took time: 13.0534ms, living objects: 8031
+TestHeapLargeObjects    Heap GC took time: 224.9326ms, living objects: 25001072
+TestArenaLargeObjects   Arena GC took time: 14.0116ms, living objects: 16819
 ```
 
 ## Caveats

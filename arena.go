@@ -14,10 +14,8 @@ const __align = unsafe.Sizeof(uintptr(0))
 
 // chunkBlock represents a contiguous memory block managed by the Arena.
 type chunkBlock struct {
-	ptr uintptr
-	len int
-	cap int
 	ref int64
+	off uintptr
 	mem []byte
 }
 
@@ -76,6 +74,7 @@ type Memory interface {
 // Arena manages memory chunks and provides allocation services with reduced GC overhead.
 // It maintains reusable memory blocks and handles alignment automatically.
 type Arena struct {
+	_           [0]sync.Mutex // NoCopy
 	locker      sync.Locker
 	memory      Memory
 	chunkSize   uintptr
@@ -102,8 +101,8 @@ func NewArena(ops ...Option) *Arena {
 	ar := &Arena{}
 	ar.locker = opts.locker
 	ar.memory = opts.memory
-	ar.chunkSize = fixSize(max(512, opts.chunkSize+__align))
-	ar.minHoleSize = fixSize(max(256, ar.chunkSize/5))
+	ar.chunkSize = fixSize(max(512, opts.chunkSize)) + __align
+	ar.minHoleSize = fixSize(max(256, ar.chunkSize/5)) + __align
 	ar.poolSize = opts.poolSize
 	ar.current = ar.malloc(ar.chunkSize)
 	ar.chunkBlocks = make(map[uintptr]*chunkBlock, 8)
@@ -127,18 +126,33 @@ func (ar *Arena) Reset() {
 
 // Free releases a previously allocated memory block.
 // The pointer must belong to this Arena.
-func (ar *Arena) Free(ptr unsafe.Pointer) {
+func (ar *Arena) Free(ptrT any) {
+	ar.locker.Lock()
+	defer ar.locker.Unlock()
+
+	pVal := reflect.ValueOf(ptrT)
+
+	switch pVal.Kind() {
+	case reflect.Ptr:
+		visited := make(map[uintptr]struct{})
+		deepFree(ar, pVal.Elem(), visited)
+		ar.freePointer(unsafe.Pointer(pVal.Pointer()))
+	case reflect.UnsafePointer:
+		ar.freePointer(pVal.UnsafePointer())
+	default:
+		panic("ptr is not a pointer: " + pVal.Type().String())
+	}
+}
+
+func (ar *Arena) freePointer(ptr unsafe.Pointer) {
 	if !ar.isManaged(uintptr(ptr)) {
 		panic("ptr must be managed by arena")
 	}
 
-	ar.locker.Lock()
-	defer ar.locker.Unlock()
-
 	ptr = unsafe.Pointer(uintptr(ptr) - __align) // 后退一个指针大小
 	chunkPtr := *(*uintptr)(ptr)                 // 获取存储的源地址
 	block := ar.current
-	if ar.current.ptr != chunkPtr {
+	if (uintptr)(unsafe.Pointer(unsafe.SliceData(ar.current.mem))) != chunkPtr {
 		var ok bool
 		if block, ok = ar.chunkBlocks[chunkPtr]; !ok {
 			panic(fmt.Errorf("pointer not malloc from Arena: %p", ptr))
@@ -147,7 +161,7 @@ func (ar *Arena) Free(ptr unsafe.Pointer) {
 
 	// 判断是否还有引用
 	if block.ref--; block.ref <= 0 {
-		block.len = 0
+		block.off = 0
 		block.ref = 0
 		if ar.current != block {
 			delete(ar.chunkBlocks, chunkPtr)
@@ -158,8 +172,6 @@ func (ar *Arena) Free(ptr unsafe.Pointer) {
 				// 释放内存
 				ar.memory.Free(block.mem)
 				// 丢弃的块，清理底层数组指针
-				block.cap = 0
-				block.ptr = 0
 				block.mem = nil
 			}
 		}
@@ -177,34 +189,40 @@ func (ar *Arena) Malloc(sz uintptr) unsafe.Pointer {
 	defer ar.locker.Unlock()
 
 	// 计算可用长度
-	availableBytes := uintptr(ar.current.cap - ar.current.len)
+	availableBytes := uintptr(cap(ar.current.mem)) - ar.current.off
 	// 计算实际需要申请的长度
-	requiredBytes := fixSize(sz + __align)
+	requiredBytes := fixSize(sz) + __align
 
 	// 请求大小超过初始块大小的直接分配
 	// 当前块剩余可用大小超过允许浪费的字节 并且小于需求大小的也直接分配 (将剩余可用空间大于浪费大小块那个块留作后用)
 	if requiredBytes > ar.chunkSize || (availableBytes < requiredBytes && availableBytes >= ar.minHoleSize) {
 		block := ar.malloc(requiredBytes)
 		block.ref = 1
-		ptr := unsafe.Pointer(block.ptr)
-		*(*uintptr)(ptr) = block.ptr
-		ar.chunkBlocks[block.ptr] = block
+		ptr := unsafe.Pointer(unsafe.SliceData(block.mem))
+		*(*uintptr)(ptr) = (uintptr)(ptr)
+		ar.chunkBlocks[(uintptr)(ptr)] = block
 		return unsafe.Add(ptr, __align)
 	}
 
 	if availableBytes < requiredBytes {
-		// 此时current剩余字节将被浪费，浪费的字节数最多不超过 ar.maxHoleSize
-		ar.chunkBlocks[ar.current.ptr] = ar.current
+		// 此时current剩余字节将被浪费，浪费的字节数最多不超过 ar.minHoleSize
+		ptr := unsafe.Pointer(unsafe.SliceData(ar.current.mem))
+		ar.chunkBlocks[(uintptr)(ptr)] = ar.current
 		ar.current = ar.malloc(ar.chunkSize)
 	}
 
-	offset := ar.current.len
+	offset := ar.current.off
 	// mark alloc
-	ar.current.len += int(requiredBytes)
+	ar.current.off += requiredBytes
 	ar.current.ref++
 
-	ptr := unsafe.Add(unsafe.Pointer(ar.current.ptr), offset)
-	*(*uintptr)(ptr) = ar.current.ptr
+	if ar.current.off > uintptr(cap(ar.current.mem)) {
+		panic("pointer out of bounds")
+	}
+
+	start := unsafe.Pointer(unsafe.SliceData(ar.current.mem))
+	ptr := unsafe.Add(start, offset)
+	*(*uintptr)(ptr) = (uintptr)(start)
 	return unsafe.Add(ptr, __align)
 }
 
@@ -218,11 +236,10 @@ func (ar *Arena) malloc(sz uintptr) *chunkBlock {
 	}
 
 	m := ar.memory.Alloc(sz)
-	if nil == m || 0 == cap(m) {
+	if nil == m || uintptr(cap(m)) < sz {
 		return nil
 	}
-	ptr := unsafe.Pointer(unsafe.SliceData(m))
-	return &chunkBlock{ptr: uintptr(ptr), cap: int(sz), ref: 0, mem: m}
+	return &chunkBlock{off: 0, ref: 0, mem: m}
 }
 
 func (ar *Arena) selectChunk(sz uintptr) *chunkBlock {
@@ -232,7 +249,7 @@ func (ar *Arena) selectChunk(sz uintptr) *chunkBlock {
 	var selected *chunkBlock
 	var idx = -1
 	for i, block := range ar.freelist {
-		if block.cap >= int(sz) && (nil == selected || block.cap < selected.cap) {
+		if cap(block.mem) >= int(sz+__align) && (nil == selected || cap(block.mem) < cap(selected.mem)) {
 			selected = block
 			idx = i
 		}
@@ -253,10 +270,9 @@ func (ar *Arena) selectChunk(sz uintptr) *chunkBlock {
 
 // Bool allocates a boolean in the Arena and initializes it with the given value.
 func (ar *Arena) Bool(v bool) *bool {
-	ptr := ar.Malloc(1)
-	boolPtr := (*bool)(ptr)
-	*boolPtr = v
-	return boolPtr
+	p := New[bool](ar)
+	*p = v
+	return p
 }
 
 // Int allocates an integer in the Arena and initializes it with the given value.
@@ -361,12 +377,16 @@ func (ar *Arena) isManaged(ptr uintptr) bool {
 	ar.locker.Lock()
 	defer ar.locker.Unlock()
 
-	if ar.current.ptr <= ptr && ptr < ar.current.ptr+uintptr(ar.current.cap) {
+	start := (uintptr)(unsafe.Pointer(unsafe.SliceData(ar.current.mem)))
+	end := start + uintptr(cap(ar.current.mem))
+	if ptr >= start && ptr < end {
 		return true
 	}
 
 	for _, chunk := range ar.chunkBlocks {
-		if chunk.ptr <= ptr && ptr < chunk.ptr+uintptr(chunk.cap) {
+		start = (uintptr)(unsafe.Pointer(unsafe.SliceData(chunk.mem)))
+		end = start + uintptr(cap(chunk.mem))
+		if ptr >= start && ptr < end {
 			return true
 		}
 	}
@@ -386,7 +406,7 @@ func CopyFrom[T any](ar *Arena, v T) *T {
 	src := reflect.ValueOf(v)
 	dst := reflect.ValueOf(p).Elem()
 	visited := make(map[uintptr]reflect.Value)
-	deepCopyArena(ar, src, dst, visited)
+	deepCopy(ar, src, dst, visited)
 	return p
 }
 
@@ -484,20 +504,37 @@ func deepCopySliceArena[T any](ar *Arena, dst []T, values []T) []T {
 	for i := range values {
 		srcVal := reflect.ValueOf(values[i])
 		dstVal := reflect.ValueOf(&newDst[idx+i]).Elem()
-		deepCopyArena(ar, srcVal, dstVal, visited)
+		deepCopy(ar, srcVal, dstVal, visited)
 	}
 	return newDst
 }
 
 // 递归深拷贝函数
-func deepCopyArena(
+func deepCopy(
 	ar *Arena,
 	src, dst reflect.Value,
 	visited map[uintptr]reflect.Value,
 ) {
+	switch src.Kind() {
+	case reflect.Map, reflect.Chan, reflect.Func:
+		panic(fmt.Sprintf("unsupported type: %s", src.Type()))
+	default:
+		if !src.CanSet() {
+			src = patchValue(src)
+		}
+
+		if !dst.CanSet() {
+			dst = patchValue(dst)
+		}
+
+		if src.IsZero() {
+			return
+		}
+	}
+
 	// 处理循环引用
-	if src.CanAddr() {
-		addr := src.UnsafeAddr()
+	if src.Kind() == reflect.Ptr && src.CanAddr() {
+		addr := src.Pointer()
 		if exist, ok := visited[addr]; ok {
 			dst.Set(exist)
 			return
@@ -513,12 +550,12 @@ func deepCopyArena(
 
 		// 创建新指针并递归拷贝
 		elemType := src.Type().Elem()
-		newPtr := ar.Malloc(unsafe.Sizeof(elemType))
+		newPtr := ar.Malloc(elemType.Size())
 		dst.Set(reflect.NewAt(elemType, newPtr))
-		deepCopyArena(ar, src.Elem(), dst.Elem(), visited)
+		deepCopy(ar, src.Elem(), dst.Elem(), visited)
 	case reflect.Array:
 		for i := 0; i < src.Len(); i++ {
-			deepCopyArena(ar, src.Index(i), dst.Index(i), visited)
+			deepCopy(ar, src.Index(i), dst.Index(i), visited)
 		}
 	case reflect.Slice:
 		if src.IsNil() {
@@ -527,23 +564,24 @@ func deepCopyArena(
 
 		// 创建新切片
 		elemType := src.Type().Elem()
-		elemSize := int(unsafe.Sizeof(elemType))
+		elemSize := elemType.Size()
 		length := src.Len()
 		capacity := src.Cap()
 
 		// 分配内存并构建切片头
-		ptr := ar.Malloc(uintptr(capacity * elemSize))
-		sh := &reflect.SliceHeader{
-			Data: uintptr(ptr),
+		ptr := ar.Malloc(uintptr(capacity) * elemSize)
+		sh := reflect.SliceHeader{
+			Data: (uintptr)(ptr),
 			Len:  length,
 			Cap:  capacity,
 		}
-		newSlice := reflect.NewAt(src.Type(), unsafe.Pointer(sh)).Elem()
+
+		newSlice := reflect.NewAt(src.Type(), unsafe.Pointer(&sh)).Elem()
 		dst.Set(newSlice)
 
 		// 递归拷贝元素
 		for i := 0; i < length; i++ {
-			deepCopyArena(ar,
+			deepCopy(ar,
 				src.Index(i),
 				newSlice.Index(i),
 				visited,
@@ -559,17 +597,14 @@ func deepCopyArena(
 	case reflect.Struct:
 		// 递归处理结构体字段
 		for i := 0; i < src.NumField(); i++ {
+			srcField := src.Field(i)
 			dstField := dst.Field(i)
-			if !dstField.CanSet() {
-				dstField = patchValue(dstField)
-			}
-			if dstField.CanSet() {
-				deepCopyArena(ar,
-					src.Field(i),
-					dstField,
-					visited,
-				)
-			}
+
+			deepCopy(ar,
+				srcField,
+				dstField,
+				visited,
+			)
 		}
 
 	case reflect.Interface:
@@ -579,21 +614,92 @@ func deepCopyArena(
 		// 创建接口值的拷贝
 		elem := src.Elem()
 		newElem := reflect.New(elem.Type()).Elem()
-		deepCopyArena(ar, elem, newElem, visited)
+		deepCopy(ar, elem, newElem, visited)
 		dst.Set(newElem)
-
-	case reflect.Map, reflect.Chan, reflect.Func:
-		panic(fmt.Sprintf("unsupported type: %s", src.Type()))
 
 	default:
 		// 直接拷贝值类型
-		if dst.CanSet() {
-			if src.CanInterface() {
-				dst.Set(src)
-			} else {
-				dst.Set(patchValue(src))
-			}
+		dst.Set(src)
+	}
+}
+
+// 递归释放函数
+// 参考deepCopy函数的实现，针对所有从Arena中申请的对象进行回收
+func deepFree(
+	ar *Arena,
+	src reflect.Value,
+	visited map[uintptr]struct{},
+) {
+	switch src.Kind() {
+	case reflect.Map, reflect.Chan, reflect.Func:
+		panic(fmt.Sprintf("unsupported type: %s", src.Type()))
+	default:
+		if !src.CanSet() {
+			src = patchValue(src)
 		}
+
+		if src.IsZero() {
+			return
+		}
+	}
+
+	// 处理循环引用
+	if src.Kind() == reflect.Ptr {
+		addr := src.Pointer()
+		if _, exists := visited[addr]; exists {
+			return
+		}
+		visited[addr] = struct{}{}
+	}
+
+	switch src.Kind() {
+	case reflect.Ptr:
+		if src.IsNil() {
+			return
+		}
+
+		// 先递归处理指针指向的值
+		deepFree(ar, src.Elem(), visited)
+
+		// 释放自身
+		ar.freePointer(unsafe.Pointer(src.Pointer()))
+
+	case reflect.Struct:
+		for i := 0; i < src.NumField(); i++ {
+			field := src.Field(i)
+			deepFree(ar, field, visited)
+		}
+
+	case reflect.Slice:
+		if src.IsNil() {
+			return
+		}
+
+		// 处理每个元素
+		for i := 0; i < src.Len(); i++ {
+			deepFree(ar, src.Index(i), visited)
+		}
+
+		// 处理底层数组指针
+		ar.freePointer(unsafe.Pointer(src.Pointer()))
+
+	case reflect.Array:
+		for i := 0; i < src.Len(); i++ {
+			deepFree(ar, src.Index(i), visited)
+		}
+	case reflect.String:
+		// 处理底层数组指针
+		ar.freePointer(unsafe.Pointer(src.Pointer()))
+
+	case reflect.Interface:
+		if src.IsNil() {
+			return
+		}
+		// 递归处理接口值
+		deepFree(ar, src.Elem(), visited)
+
+	default:
+		// 其他基础类型无需处理
 	}
 }
 

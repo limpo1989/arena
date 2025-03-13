@@ -306,7 +306,7 @@ func prepareArenaArgs(ar *Arena) *largeMessage {
 	return args
 }
 
-const largeSize = 1024 * 1024 * 5
+const largeSize = 1000 * 1000 * 10
 
 func TestHeapLargeObjects(t *testing.T) {
 	var m = make([]*largeMessage, largeSize)
