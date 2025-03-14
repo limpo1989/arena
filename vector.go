@@ -1,9 +1,5 @@
 package arena
 
-import (
-	"unsafe"
-)
-
 // Vector is an Arena-backed dynamic array providing type-safe operations.
 // It reduces GC pressure by storing elements in contiguous Arena memory.
 type Vector[T any] struct {
@@ -15,13 +11,11 @@ type Vector[T any] struct {
 // NewVector creates a new Vector with specified initial capacity.
 // The vector's memory is managed by the provided Arena allocator.
 func NewVector[T any](allocator *Arena, capacity int) *Vector[T] {
-	const vecSz = unsafe.Sizeof(Vector[T]{})
-	// 分配Vector对象
-	vec := (*Vector[T])(allocator.Malloc(vecSz))
-	vec.allocator = allocator
-	vec.equatable = defaultEqual[T]
-	vec.vec = NewSlice[T](allocator, 0, capacity)
-	return vec
+	return &Vector[T]{
+		allocator: allocator,
+		equatable: deepEqual[T],
+		vec:       NewSlice[T](allocator, 0, capacity),
+	}
 }
 
 // Equatable sets a custom equality comparison function for element comparison.
@@ -132,4 +126,10 @@ func (v *Vector[T]) LastIndex(value T) int {
 		}
 	}
 	return -1
+}
+
+// Clear remove all elements.
+func (v *Vector[T]) Clear() {
+	v.allocator.Free(v.vec)
+	v.vec = nil
 }

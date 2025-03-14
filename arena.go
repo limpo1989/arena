@@ -65,7 +65,7 @@ func WithMemory(memory Memory) Option {
 	}
 }
 
-// Memory 内存分配器，默认使用Go堆内存实现
+// Memory represents a alternative memory sources (e.g., mmap, cgo, shm).
 type Memory interface {
 	Alloc(size uintptr) []byte
 	Free(m []byte)
@@ -132,16 +132,8 @@ func (ar *Arena) Free(ptrT any) {
 
 	pVal := reflect.ValueOf(ptrT)
 
-	switch pVal.Kind() {
-	case reflect.Ptr:
-		visited := make(map[uintptr]struct{})
-		deepFree(ar, pVal.Elem(), visited)
-		ar.freePointer(unsafe.Pointer(pVal.Pointer()))
-	case reflect.UnsafePointer:
-		ar.freePointer(pVal.UnsafePointer())
-	default:
-		panic("ptr is not a pointer: " + pVal.Type().String())
-	}
+	visited := make(map[uintptr]struct{})
+	deepFree(ar, pVal, visited)
 }
 
 func (ar *Arena) freePointer(ptr unsafe.Pointer) {
@@ -160,9 +152,8 @@ func (ar *Arena) freePointer(ptr unsafe.Pointer) {
 	}
 
 	// 判断是否还有引用
-	if block.ref--; block.ref <= 0 {
+	if block.ref--; block.ref == 0 {
 		block.off = 0
-		block.ref = 0
 		if ar.current != block {
 			delete(ar.chunkBlocks, chunkPtr)
 			// 追加到可用列表
@@ -226,7 +217,6 @@ func (ar *Arena) Malloc(sz uintptr) unsafe.Pointer {
 	return unsafe.Add(ptr, __align)
 }
 
-// malloc 内存分配
 func (ar *Arena) malloc(sz uintptr) *chunkBlock {
 	// 优先复用内存
 	if len(ar.freelist) > 0 {
@@ -361,7 +351,7 @@ func (ar *Arena) Float64(v float64) *float64 {
 
 // String allocates and initializes a string in the Arena by copying the input.
 func (ar *Arena) String(v string) (s *string) {
-	return CopyFrom(ar, v)
+	return DeepCopy(ar, v)
 }
 
 // Bytes allocates a byte slice in the Arena and copies the input data.
@@ -399,9 +389,9 @@ func isArenaManagedSlice[T any](ar *Arena, s []T) bool {
 	return ar.isManaged(dataPtr)
 }
 
-// CopyFrom 从Arena中分配一个对象并从源对象中深度拷贝，并返回拷贝对象的指针
-// 注意：这个对象不受GC管理，它的生命周期依赖Arena本身
-func CopyFrom[T any](ar *Arena, v T) *T {
+// DeepCopy allocates an object of type T from the Arena and performs a deep copy of the source object v into it.
+// The underlying memory is managed by the Arena.
+func DeepCopy[T any](ar *Arena, v T) *T {
 	p := New[T](ar)
 	src := reflect.ValueOf(v)
 	dst := reflect.ValueOf(p).Elem()
@@ -426,7 +416,7 @@ func NewSlice[T any](ar *Arena, length, capacity int) (result []T) {
 	}
 
 	// 计算总需要内存 头 + 数据长度
-	elemSize := Sizeof[T]()
+	elemSize := sizeOf[T]()
 	sz := elemSize * uintptr(capacity)
 	ptr := ar.Malloc(sz)
 
@@ -439,11 +429,13 @@ func NewSlice[T any](ar *Arena, length, capacity int) (result []T) {
 }
 
 // Append extends a slice managed by the Arena, reallocating if necessary.
-// The source slice must be Arena-managed. Returns the new slice.
+// The underlying memory is managed by the Arena.
 func Append[T any](ar *Arena, src []T, values ...T) []T {
 	// 1. 验证源切片是否来自arena
-	if !isArenaManagedSlice(ar, src) {
-		panic("source slice must be managed by arena")
+	if nil != src {
+		if !isArenaManagedSlice(ar, src) {
+			panic("source slice must be managed by arena")
+		}
 	}
 
 	// 2. 计算需要扩容的情况
@@ -454,18 +446,21 @@ func Append[T any](ar *Arena, src []T, values ...T) []T {
 		return deepCopySliceArena(ar, newSlice, values)
 	}
 
-	// 注意: 这里针对src进行扩容后，并没有主动释放src所指向的内存块
-	// 这是因为业务代码可能还在引用着src中的对象，因此无法安全的释放，因此这里不主动释放，而是交给GC管理
-	// 即src所指向的原始Arena对象被回收后src也将失效
-	// 可能会导致内存泄露，比如在同一个长期持有的Arena对象上分配的Slice不断进行扩容，触发扩容时原有src并没有被释放并被重用
-	// 这将导致内存持续增加，严重的情况下甚至可能导致OOM
+	defer func() {
+		// 针对原有的数据区进行回收
+		if nil != src {
+			ar.Free(src)
+		}
+	}()
 
 	// 3. 执行扩容策略
 	newCap := calculateNewCap(len(src), len(values))
 	newSlice := NewSlice[T](ar, len(src), newCap)
 
 	// 4. 深拷贝原始数据
-	deepCopySliceArena(ar, newSlice[:0], src)
+	if len(src) > 0 {
+		deepCopySliceArena(ar, newSlice[:0], src)
+	}
 
 	// 5. 追加新元素（深拷贝）
 	return deepCopySliceArena(ar, newSlice, values)
@@ -474,18 +469,16 @@ func Append[T any](ar *Arena, src []T, values ...T) []T {
 // New allocates memory for a type T and returns a pointer to it.
 // The object's lifetime is tied to the Arena.
 func New[T any](ar *Arena) *T {
-	size := Sizeof[T]()
+	size := sizeOf[T]()
 	return (*T)(ar.Malloc(size))
 }
 
-// Sizeof 计算类型所占内存大小
-func Sizeof[T any]() uintptr {
+func sizeOf[T any]() uintptr {
 	var zero T
 	return unsafe.Sizeof(zero)
 }
 
 func calculateNewCap(current, appendLen int) int {
-	// 混合扩容策略：至少增长25%或满足需求
 	minGrowth := current + appendLen
 	newCap := current * 5 / 4 // 25% growth
 	if newCap < minGrowth {
@@ -509,7 +502,6 @@ func deepCopySliceArena[T any](ar *Arena, dst []T, values []T) []T {
 	return newDst
 }
 
-// 递归深拷贝函数
 func deepCopy(
 	ar *Arena,
 	src, dst reflect.Value,
@@ -623,8 +615,6 @@ func deepCopy(
 	}
 }
 
-// 递归释放函数
-// 参考deepCopy函数的实现，针对所有从Arena中申请的对象进行回收
 func deepFree(
 	ar *Arena,
 	src reflect.Value,
@@ -697,13 +687,15 @@ func deepFree(
 		}
 		// 递归处理接口值
 		deepFree(ar, src.Elem(), visited)
-
+	case reflect.UnsafePointer:
+		// 释放指针
+		ar.freePointer(unsafe.Pointer(src.Pointer()))
 	default:
 		// 其他基础类型无需处理
 	}
 }
 
-func defaultEqual[T any](a, b T) bool {
+func deepEqual[T any](a, b T) bool {
 	return reflect.DeepEqual(a, b)
 }
 

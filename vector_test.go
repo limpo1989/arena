@@ -207,3 +207,27 @@ func TestVector_RemoveOne(t *testing.T) {
 
 	runtime.KeepAlive(arena)
 }
+
+func TestVector_Clear(t *testing.T) {
+	arena := NewArena()
+	vec := NewVector[int](arena, 8)
+	vec.Append(1, 2, 3)
+	assert.Equal(t, 3, vec.Len())
+	vec.Append(4)
+	vec.Append(5)
+	vec.Append(6)
+	vec.Append(7)
+	vec.Append(8)
+	vec.Append(9)
+	assert.Equal(t, 9, vec.Len())
+	for i := 0; i < vec.Len(); i++ {
+		assert.Equal(t, i+1, vec.At(i))
+	}
+	vec.Clear()
+
+	if arena.current.ref != 0 {
+		t.Fatalf("arena.current.ref %d not zero", arena.current.ref)
+	}
+
+	runtime.KeepAlive(arena)
+}
