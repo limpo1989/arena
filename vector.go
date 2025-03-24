@@ -15,6 +15,8 @@
 
 package arena
 
+import "iter"
+
 // Vector is an Arena-backed dynamic array providing type-safe operations.
 // It reduces GC pressure by storing elements in contiguous Arena memory.
 type Vector[T any] struct {
@@ -70,7 +72,7 @@ func (v *Vector[T]) Range(fn func(index int, v T) bool) {
 //	for index, v := range v.Iter() {
 //		// do something
 //	}
-func (v *Vector[T]) Iter() func(func(index int, v T) bool) {
+func (v *Vector[T]) Iter() iter.Seq2[int, T] {
 	return v.Range
 }
 
