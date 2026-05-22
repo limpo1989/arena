@@ -15,24 +15,28 @@
 
 package arena
 
-import "iter"
+import (
+	"iter"
+	"reflect"
+)
 
 // Vector is an Arena-backed dynamic array providing type-safe operations.
 // It reduces GC pressure by storing elements in contiguous Arena memory.
 type Vector[T any] struct {
 	allocator *Arena
-	equatable func(a, b T) bool
+	equatable func(a, b T) bool `arena:"safe"`
 	vec       []T
 }
 
 // NewVector creates a new Vector with specified initial capacity.
 // The vector's memory is managed by the provided Arena allocator.
 func NewVector[T any](allocator *Arena, capacity int) *Vector[T] {
-	return &Vector[T]{
-		allocator: allocator,
-		equatable: deepEqual[T],
-		vec:       NewSlice[T](allocator, 0, capacity),
-	}
+	validateType[T]()
+	v := New[Vector[T]](allocator)
+	v.allocator = allocator
+	v.equatable = deepEqual[T]
+	v.vec = NewSlice[T](allocator, 0, capacity)
+	return v
 }
 
 // Equatable sets a custom equality comparison function for element comparison.
@@ -56,24 +60,15 @@ func (v *Vector[T]) At(index int) T {
 	return v.vec[index]
 }
 
-// Range iterates over elements using a callback function.
-func (v *Vector[T]) Range(fn func(index int, v T) bool) {
-	for i := 0; i < len(v.vec); i++ {
-		if !fn(i, v.vec[i]) {
-			return
+// All provides an iterator function compatible with range loops.
+func (v *Vector[T]) All() iter.Seq2[int, T] {
+	return func(yield func(int, T) bool) {
+		for i, val := range v.vec {
+			if !yield(i, val) {
+				return
+			}
 		}
 	}
-}
-
-// Iter provides an iterator function compatible with range loops.
-//
-// Example:
-//
-//	for index, v := range v.Iter() {
-//		// do something
-//	}
-func (v *Vector[T]) Iter() iter.Seq2[int, T] {
-	return v.Range
 }
 
 // Append adds elements to the end of the vector.
@@ -149,4 +144,23 @@ func (v *Vector[T]) LastIndex(value T) int {
 func (v *Vector[T]) Clear() {
 	v.allocator.Free(v.vec)
 	v.vec = nil
+}
+
+// arenaDeepCopy implements the deepCopier interface.
+func (v *Vector[T]) arenaDeepCopy(allocator *Arena) reflect.Value {
+	newVec := NewVector[T](allocator, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		newVec.Append(v.At(i))
+	}
+	return reflect.ValueOf(newVec)
+}
+
+// auditPointers implements the arenaAuditer interface.
+func (v *Vector[T]) auditPointers(ar *Arena, path string, violations *[]PointerViolation, visited map[uintptr]struct{}) {
+	for i := 0; i < len(v.vec); i++ {
+		elemPath := path + ".vec[" + itoa(i) + "]"
+		elemField := reflect.ValueOf(&v.vec[i]).Elem()
+		elemVal := patchValue(elemField)
+		auditValue(ar, elemVal, elemPath, violations, visited)
+	}
 }

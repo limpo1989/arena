@@ -66,7 +66,11 @@ func WithPoolSize(poolSize int) Option {
 // When enabled, adds ~5-15ns overhead per allocation.
 func WithEnableLock(enableLock bool) Option {
 	return func(o *arenaOptions) {
-		o.locker = new(internal.SpinLock)
+		if enableLock {
+			o.locker = new(internal.SpinLock)
+		} else {
+			o.locker = nopLocker{}
+		}
 	}
 }
 
@@ -97,6 +101,7 @@ type Arena struct {
 	chunkBlocks map[uintptr]*chunkBlock
 	current     *chunkBlock
 	freelist    []*chunkBlock
+	visited     map[uintptr]struct{}
 }
 
 // NewArena creates a new Arena instance with customizable options.
@@ -120,6 +125,7 @@ func NewArena(ops ...Option) *Arena {
 	ar.poolSize = opts.poolSize
 	ar.current = ar.malloc(ar.chunkSize)
 	ar.chunkBlocks = make(map[uintptr]*chunkBlock, 8)
+	ar.visited = make(map[uintptr]struct{}, 128)
 	return ar
 }
 
@@ -146,8 +152,8 @@ func (ar *Arena) Free(ptrT any) {
 
 	pVal := reflect.ValueOf(ptrT)
 
-	visited := make(map[uintptr]struct{})
-	deepFree(ar, pVal, visited)
+	clear(ar.visited)
+	deepFree(ar, pVal, ar.visited)
 }
 
 func (ar *Arena) freePointer(ptr unsafe.Pointer) {
@@ -378,9 +384,6 @@ func (ar *Arena) Bytes(v []byte) (b []byte) {
 }
 
 func (ar *Arena) isManaged(ptr uintptr) bool {
-	ar.locker.Lock()
-	defer ar.locker.Unlock()
-
 	start := (uintptr)(unsafe.Pointer(unsafe.SliceData(ar.current.mem)))
 	end := start + uintptr(cap(ar.current.mem))
 	if ptr >= start && ptr < end {
@@ -406,10 +409,11 @@ func isArenaManagedSlice[T any](ar *Arena, s []T) bool {
 // DeepCopy allocates an object of type T from the Arena and performs a deep copy of the source object v into it.
 // The underlying memory is managed by the Arena.
 func DeepCopy[T any](ar *Arena, v T) *T {
+	validateType[T]()
 	p := New[T](ar)
 	src := reflect.ValueOf(v)
 	dst := reflect.ValueOf(p).Elem()
-	visited := make(map[uintptr]reflect.Value)
+	visited := make(map[uintptr]reflect.Value, 64)
 	deepCopy(ar, src, dst, visited)
 	return p
 }
@@ -417,6 +421,7 @@ func DeepCopy[T any](ar *Arena, v T) *T {
 // NewSlice allocates a slice of type T with the specified length and capacity.
 // The underlying memory is managed by the Arena.
 func NewSlice[T any](ar *Arena, length, capacity int) (result []T) {
+	validateType[T]()
 	if length > capacity {
 		capacity = length
 	}
@@ -429,16 +434,10 @@ func NewSlice[T any](ar *Arena, length, capacity int) (result []T) {
 		return
 	}
 
-	// 计算总需要内存 头 + 数据长度
 	elemSize := sizeOf[T]()
 	sz := elemSize * uintptr(capacity)
 	ptr := ar.Malloc(sz)
-
-	// 初始化slice数据结构
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&result))
-	sh.Data = uintptr(ptr)
-	sh.Len = length
-	sh.Cap = capacity
+	result = unsafe.Slice((*T)(ptr), capacity)[:length]
 	return
 }
 
@@ -447,7 +446,10 @@ func NewSlice[T any](ar *Arena, length, capacity int) (result []T) {
 func Append[T any](ar *Arena, src []T, values ...T) []T {
 	// 1. 验证源切片是否来自arena
 	if nil != src {
-		if !isArenaManagedSlice(ar, src) {
+		ar.locker.Lock()
+		managed := isArenaManagedSlice(ar, src)
+		ar.locker.Unlock()
+		if !managed {
 			panic("source slice must be managed by arena")
 		}
 	}
@@ -483,6 +485,7 @@ func Append[T any](ar *Arena, src []T, values ...T) []T {
 // New allocates memory for a type T and returns a pointer to it.
 // The object's lifetime is tied to the Arena.
 func New[T any](ar *Arena) *T {
+	validateType[T]()
 	size := sizeOf[T]()
 	return (*T)(ar.Malloc(size))
 }
@@ -505,7 +508,7 @@ func deepCopySliceArena[T any](ar *Arena, dst []T, values []T) []T {
 	if n := cap(dst) - len(dst); n < len(values) {
 		panic(fmt.Errorf("no available capacity to copied: cap: %d, len: %d, avaliable: %d, required: %d", cap(dst), len(dst), n, len(values)))
 	}
-	visited := make(map[uintptr]reflect.Value)
+	visited := make(map[uintptr]reflect.Value, 64)
 	idx := len(dst)
 	newDst := dst[:idx+len(values)]
 	for i := range values {
@@ -516,11 +519,25 @@ func deepCopySliceArena[T any](ar *Arena, dst []T, values []T) []T {
 	return newDst
 }
 
+// deepCopier is an internal interface for arena container types
+// to control their own deep copy semantics.
+type deepCopier interface {
+	arenaDeepCopy(allocator *Arena) reflect.Value
+}
+
 func deepCopy(
 	ar *Arena,
 	src, dst reflect.Value,
 	visited map[uintptr]reflect.Value,
 ) {
+	// Check for deepCopier interface (arena container types)
+	if src.CanInterface() {
+		if dc, ok := src.Interface().(deepCopier); ok {
+			dst.Set(dc.arenaDeepCopy(ar))
+			return
+		}
+	}
+
 	switch src.Kind() {
 	case reflect.Map, reflect.Chan, reflect.Func:
 		panic(fmt.Sprintf("unsupported type: %s", src.Type()))
@@ -574,15 +591,8 @@ func deepCopy(
 		length := src.Len()
 		capacity := src.Cap()
 
-		// 分配内存并构建切片头
 		ptr := ar.Malloc(uintptr(capacity) * elemSize)
-		sh := reflect.SliceHeader{
-			Data: (uintptr)(ptr),
-			Len:  length,
-			Cap:  capacity,
-		}
-
-		newSlice := reflect.NewAt(src.Type(), unsafe.Pointer(&sh)).Elem()
+		newSlice := makeSliceFromPtr(elemType, ptr, length, capacity)
 		dst.Set(newSlice)
 
 		// 递归拷贝元素
@@ -617,11 +627,12 @@ func deepCopy(
 		if src.IsNil() {
 			return
 		}
-		// 创建接口值的拷贝
 		elem := src.Elem()
-		newElem := reflect.New(elem.Type()).Elem()
+		elemType := elem.Type()
+		newPtr := ar.Malloc(elemType.Size())
+		newElem := reflect.NewAt(elemType, newPtr).Elem()
 		deepCopy(ar, elem, newElem, visited)
-		dst.Set(newElem)
+		dst.Set(newElem.Addr())
 
 	default:
 		// 直接拷贝值类型

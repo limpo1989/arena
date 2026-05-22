@@ -1,0 +1,100 @@
+syntax = "proto2";
+package test;
+
+option go_package = "github.com/limpo1989/arena/cmd/protoc-gen-arena/testdata/arenatest";
+
+// Enum types
+enum Role {
+  UNKNOWN = 0;
+  ADMIN = 1;
+  USER = 2;
+  GUEST = -1;
+}
+
+// All scalar field types
+message Scalars {
+  optional int32 opt_int32 = 1;
+  optional int64 opt_int64 = 2;
+  optional uint32 opt_uint32 = 3;
+  optional uint64 opt_uint64 = 4;
+  optional sint32 opt_sint32 = 5;
+  optional sint64 opt_sint64 = 6;
+  optional fixed32 opt_fixed32 = 7;
+  optional fixed64 opt_fixed64 = 8;
+  optional sfixed32 opt_sfixed32 = 9;
+  optional sfixed64 opt_sfixed64 = 10;
+  optional float opt_float = 11;
+  optional double opt_double = 12;
+  optional bool opt_bool = 13;
+  optional string opt_string = 14;
+  optional bytes opt_bytes = 15;
+  optional Role opt_enum = 16;
+
+  required string req_string = 20;
+  required int32 req_int32 = 21;
+}
+
+message Defaults {
+  optional int32 with_default = 1 [default = 42];
+  optional string str_default = 2 [default = "hello"];
+  optional bool bool_default = 3 [default = true];
+  optional Role enum_default = 4 [default = ADMIN];
+}
+
+// Repeated fields
+message Repeated {
+  repeated int32 unpacked_int32 = 1;
+  repeated string strings = 2;
+  repeated int32 packed_int32 = 3 [packed = true];
+  repeated Role packed_enum = 4 [packed = true];
+  repeated double doubles = 5 [packed = true];
+  repeated bytes byte_slices = 6;
+}
+
+// Nested messages
+message Inner {
+  optional string name = 1;
+  optional int32 value = 2;
+}
+
+message Middle {
+  optional Inner inner = 1;
+  optional string label = 2;
+}
+
+message Outer {
+  optional Middle middle = 1;
+  optional string tag = 2;
+}
+
+// Map fields
+message Maps {
+  map<string, int32> string_int32 = 1;
+  map<string, string> string_string = 2;
+  map<int32, Inner> int32_msg = 3;
+}
+
+// Oneof
+message OneofMsg {
+  optional string name = 1;
+  oneof choice {
+    string str_val = 2;
+    bytes bytes_val = 3;
+    Inner msg_val = 4;
+    int32 int_val = 5;
+  }
+}
+
+// Full-featured message for round-trip testing
+message FullMessage {
+  optional int32 id = 1;
+  optional string label = 2;
+  repeated string tags = 3;
+  map<string, int32> scores = 4;
+  optional Inner nested = 5;
+  optional Role role = 6;
+  oneof payload {
+    string text_payload = 7;
+    bytes binary_payload = 8;
+  }
+}

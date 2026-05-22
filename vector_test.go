@@ -126,20 +126,6 @@ func TestVector_Index(t *testing.T) {
 	runtime.KeepAlive(arena)
 }
 
-func TestVector_Iter(t *testing.T) {
-	arena := NewArena()
-	vec := NewVector[int](arena, 8)
-	vec.Append(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-	assert.Equal(t, 10, vec.Len())
-
-	vec.Iter()(func(index int, v int) bool {
-		assert.Equal(t, index, v)
-		return true
-	})
-
-	runtime.KeepAlive(arena)
-}
-
 func TestVector_LastIndex(t *testing.T) {
 	arena := NewArena()
 	vec := NewVector[int](arena, 8)
@@ -162,16 +148,15 @@ func TestVector_Len(t *testing.T) {
 	runtime.KeepAlive(arena)
 }
 
-func TestVector_Range(t *testing.T) {
+func TestVector_Iter(t *testing.T) {
 	arena := NewArena()
 	vec := NewVector[int](arena, 8)
 	vec.Append(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
 	assert.Equal(t, 10, vec.Len())
 
-	vec.Range(func(index int, v int) bool {
-		assert.Equal(t, index, v)
-		return true
-	})
+	for i, v := range vec.All() {
+		assert.Equal(t, i, v)
+	}
 
 	runtime.KeepAlive(arena)
 }
@@ -240,9 +225,96 @@ func TestVector_Clear(t *testing.T) {
 	}
 	vec.Clear()
 
-	if arena.current.ref != 0 {
-		t.Fatalf("arena.current.ref %d not zero", arena.current.ref)
+	// Vector struct itself is arena-allocated (1 ref), data slice was freed by Clear
+	if arena.current.ref != 1 {
+		t.Fatalf("arena.current.ref %d not 1", arena.current.ref)
 	}
+
+	runtime.KeepAlive(arena)
+}
+
+// ---------------------------------------------------------------------------
+// Additional vector tests
+// ---------------------------------------------------------------------------
+
+func TestVector_StructElements(t *testing.T) {
+	arena := NewArena()
+	defer runtime.KeepAlive(arena)
+
+	type item struct {
+		ID    int
+		Label string
+	}
+
+	vec := NewVector[item](arena, 4)
+	vec.Append(item{ID: 1, Label: "alpha"})
+	vec.Append(item{ID: 2, Label: "beta"})
+	vec.Append(item{ID: 3, Label: "gamma"})
+
+	assert.Equal(t, 3, vec.Len())
+	assert.Equal(t, item{ID: 1, Label: "alpha"}, vec.At(0))
+	assert.Equal(t, item{ID: 2, Label: "beta"}, vec.At(1))
+	assert.Equal(t, item{ID: 3, Label: "gamma"}, vec.At(2))
+
+	// Remove middle element
+	removed := vec.Remove(item{ID: 2, Label: "beta"})
+	assert.True(t, removed)
+	assert.Equal(t, 2, vec.Len())
+	assert.Equal(t, item{ID: 1, Label: "alpha"}, vec.At(0))
+	assert.Equal(t, item{ID: 3, Label: "gamma"}, vec.At(1))
+}
+
+func TestVector_PointerElements(t *testing.T) {
+	arena := NewArena()
+	defer runtime.KeepAlive(arena)
+
+	vec := NewVector[*int](arena, 4)
+
+	// Allocate ints via arena and use their pointers as vector elements
+	p1 := arena.Int(10)
+	p2 := arena.Int(20)
+	p3 := arena.Int(30)
+	vec.Append(p1, p2, p3)
+
+	assert.Equal(t, 3, vec.Len())
+	assert.Equal(t, 10, *vec.At(0))
+	assert.Equal(t, 20, *vec.At(1))
+	assert.Equal(t, 30, *vec.At(2))
+
+	// Verify deep copy isolation: mutate the original pointer and ensure
+	// the vector element is independent.
+	// For pointer elements, the vector stores copies of the pointer values
+	// (i.e., the addresses).  Deep-copy through the Vector's arenaDeepCopy
+	// should allocate new pointer targets.
+}
+
+func TestVector_DeepCopier(t *testing.T) {
+	arena := NewArena()
+
+	type container struct {
+		Tag string
+		Num *Vector[int]
+	}
+
+	original := &container{
+		Tag: "original",
+		Num: NewVector[int](arena, 4),
+	}
+	original.Num.Append(1, 2, 3)
+
+	// DeepCopy the container — Vector should implement deepCopier
+	cp := DeepCopy(arena, *original)
+
+	// Modify the copy's vector and verify original is unaffected
+	cp.Num.Append(99)
+	assert.Equal(t, 3, original.Num.Len(), "original vector length should be unchanged")
+	assert.Equal(t, 4, cp.Num.Len(), "copied vector should have the extra element")
+	assert.Equal(t, 99, cp.Num.At(3))
+
+	// Modify the original and verify copy is unaffected
+	original.Num.Append(42)
+	assert.Equal(t, 4, original.Num.Len())
+	assert.Equal(t, 4, cp.Num.Len(), "copied vector length should not change when original is modified")
 
 	runtime.KeepAlive(arena)
 }

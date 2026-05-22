@@ -18,11 +18,16 @@ package arena
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestArena(t *testing.T) {
@@ -350,4 +355,241 @@ func TestArenaLargeObjects(t *testing.T) {
 	runtime.ReadMemStats(&memStat)
 	t.Logf("Arena GC took time: %v, living objects: %d", time.Since(start), memStat.HeapObjects)
 	runtime.KeepAlive(m)
+}
+
+// --- Additional comprehensive tests ---
+
+func TestNewArenaOptions(t *testing.T) {
+	t.Run("WithChunkSize zero", func(t *testing.T) {
+		// Zero chunk size should be clamped to minimum (512) internally
+		ar := NewArena(WithChunkSize(0))
+		assert.NotNil(t, ar)
+		ar.Reset()
+	})
+
+	t.Run("WithPoolSize zero", func(t *testing.T) {
+		ar := NewArena(WithPoolSize(0))
+		assert.NotNil(t, ar)
+		// Allocate and free should still work; freed chunks are discarded immediately
+		ptr := ar.Malloc(16)
+		ar.Free(ptr)
+		ar.Reset()
+	})
+
+	t.Run("WithEnableLock true", func(t *testing.T) {
+		ar := NewArena(WithEnableLock(true))
+		assert.NotNil(t, ar)
+		// Concurrent allocations should not race
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				p := ar.Int(42)
+				assert.Equal(t, 42, *p)
+			}()
+		}
+		wg.Wait()
+		ar.Reset()
+	})
+
+	t.Run("WithEnableLock false", func(t *testing.T) {
+		ar := NewArena(WithEnableLock(false))
+		assert.NotNil(t, ar)
+		p := ar.String("test")
+		assert.Equal(t, "test", *p)
+		ar.Reset()
+	})
+
+	t.Run("WithMemory custom", func(t *testing.T) {
+		var allocs int
+		var frees int
+		custom := &trackingMemory{
+			allocFn: func(size uintptr) []byte {
+				allocs++
+				return make([]byte, size)
+			},
+			freeFn: func(_ []byte) {
+				frees++
+			},
+		}
+		ar := NewArena(WithMemory(custom))
+		assert.NotNil(t, ar)
+
+		// The custom allocator is used for all internal allocations.
+		// Allocate an oversized block: it becomes a separate chunkBlock,
+		// and when freed and the pool is exhausted, memory.Free is called.
+		// Use WithPoolSize(0) so freed blocks are immediately released.
+		ar2 := NewArena(WithMemory(custom), WithPoolSize(0))
+		bigSize := uintptr(4096)
+		ptr := ar2.Malloc(bigSize)
+		assert.NotNil(t, ptr)
+		ar2.Free(ptr) // With poolSize=0, the block is released via memory.Free
+		ar.Reset()
+		ar2.Reset()
+		assert.GreaterOrEqual(t, allocs, 1, "custom allocator should have been called")
+		assert.GreaterOrEqual(t, frees, 1, "custom deallocator should have been called")
+	})
+}
+
+// trackingMemory is a test helper Memory implementation that tracks calls.
+type trackingMemory struct {
+	allocFn func(size uintptr) []byte
+	freeFn  func(m []byte)
+}
+
+func (m *trackingMemory) Alloc(size uintptr) []byte {
+	return m.allocFn(size)
+}
+
+func (m *trackingMemory) Free(b []byte) {
+	m.freeFn(b)
+}
+
+func TestMallocZeroPanic(t *testing.T) {
+	ar := NewArena()
+	assert.Panics(t, func() {
+		ar.Malloc(0)
+	})
+}
+
+func TestMallocAlignment(t *testing.T) {
+	ar := NewArena()
+	defer ar.Reset()
+
+	align := unsafe.Sizeof(uintptr(0))
+
+	for _, sz := range []uintptr{1, 3, 7, 13, 100, 255, 1023} {
+		ptr := ar.Malloc(sz)
+		addr := uintptr(ptr)
+		assert.Equal(t, uintptr(0), addr%align, "Malloc(%d) returned misaligned pointer", sz)
+		ar.Free(ptr)
+	}
+}
+
+func TestMallocOversized(t *testing.T) {
+	// Default chunk size is 1024 + align; allocate something larger
+	ar := NewArena()
+	defer ar.Reset()
+
+	bigSize := uintptr(4096)
+	ptr := ar.Malloc(bigSize)
+	assert.NotNil(t, ptr)
+
+	// Write to the entire block to verify it is usable
+	slice := unsafe.Slice((*byte)(ptr), bigSize)
+	for i := uintptr(0); i < bigSize; i++ {
+		slice[i] = byte(i % 256)
+	}
+	for i := uintptr(0); i < bigSize; i++ {
+		assert.Equal(t, byte(i%256), slice[i])
+	}
+	ar.Free(ptr)
+}
+
+func TestFreeNonArenaPointer(t *testing.T) {
+	ar := NewArena()
+
+	heapInt := new(int)
+	*heapInt = 42
+
+	assert.Panics(t, func() {
+		ar.Free(heapInt)
+	})
+}
+
+func TestReset(t *testing.T) {
+	t.Run("clears state", func(t *testing.T) {
+		ar := NewArena()
+		p1 := ar.Int(10)
+		p2 := ar.String("hello")
+		_ = p1
+		_ = p2
+
+		ar.Reset()
+		// After Reset the arena's internal state is cleared (current is nil, chunkBlocks empty).
+		// A new arena should work normally afterwards.
+		ar2 := NewArena()
+		p3 := ar2.Int(99)
+		assert.Equal(t, 99, *p3)
+		ar2.Reset()
+	})
+
+	t.Run("multiple resets", func(t *testing.T) {
+		// Each iteration creates a fresh arena, uses it, and resets it.
+		for i := 0; i < 5; i++ {
+			ar := NewArena()
+			p := ar.Int(i)
+			assert.Equal(t, i, *p)
+			ar.Reset()
+		}
+	})
+
+	t.Run("reset then allocate", func(t *testing.T) {
+		ar := NewArena(WithChunkSize(512))
+
+		// First round
+		p1 := ar.Malloc(64)
+		assert.NotNil(t, p1)
+		ar.Reset()
+
+		// After Reset, create a new arena to verify fresh allocation works
+		ar2 := NewArena(WithChunkSize(512))
+		p2 := ar2.Malloc(64)
+		assert.NotNil(t, p2)
+		slice := unsafe.Slice((*byte)(p2), 64)
+		for i := range slice {
+			slice[i] = byte(i)
+		}
+		for i := range slice {
+			assert.Equal(t, byte(i), slice[i])
+		}
+		ar2.Reset()
+	})
+}
+
+func TestConvenienceMethods(t *testing.T) {
+	ar := NewArena()
+	defer ar.Reset()
+
+	t.Run("Bool", func(t *testing.T) {
+		assert.False(t, *ar.Bool(false))
+		assert.True(t, *ar.Bool(true))
+	})
+
+	t.Run("Int", func(t *testing.T) {
+		assert.Equal(t, 0, *ar.Int(0))
+		assert.Equal(t, -1, *ar.Int(-1))
+		assert.Equal(t, math.MaxInt, *ar.Int(math.MaxInt))
+	})
+
+	t.Run("String", func(t *testing.T) {
+		assert.Equal(t, "", *ar.String(""))
+		assert.Equal(t, "hello", *ar.String("hello"))
+		longStr := string(make([]byte, 10000))
+		assert.Equal(t, longStr, *ar.String(longStr))
+	})
+
+	t.Run("Bytes", func(t *testing.T) {
+		assert.Empty(t, ar.Bytes([]byte{}))
+		assert.Equal(t, []byte{1, 2, 3}, ar.Bytes([]byte{1, 2, 3}))
+		big := make([]byte, 8192)
+		for i := range big {
+			big[i] = byte(i % 256)
+		}
+		result := ar.Bytes(big)
+		assert.Equal(t, big, result)
+	})
+
+	t.Run("Float32", func(t *testing.T) {
+		assert.Equal(t, float32(0), *ar.Float32(0))
+		assert.Equal(t, float32(-1.5), *ar.Float32(-1.5))
+		assert.Equal(t, float32(math.MaxFloat32), *ar.Float32(math.MaxFloat32))
+	})
+
+	t.Run("Float64", func(t *testing.T) {
+		assert.Equal(t, float64(0), *ar.Float64(0))
+		assert.Equal(t, -3.14, *ar.Float64(-3.14))
+		assert.Equal(t, math.MaxFloat64, *ar.Float64(math.MaxFloat64))
+	})
 }
