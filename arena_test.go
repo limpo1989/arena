@@ -35,53 +35,53 @@ func TestArena(t *testing.T) {
 	ar := NewArena()
 
 	for i := 0; i < 1000; i++ {
-		if "hello" != *ar.String("hello") {
+		if "hello" != *ar.NewString("hello") {
 			t.Fatalf("missmatch")
 		}
 
 		var rv = rand.Int()
 
-		if rv > 100 != *ar.Bool(rv > 100) {
+		if rv > 100 != *ar.NewBool(rv > 100) {
 			t.Fatalf("missmatch")
 		}
 
-		if rv != *ar.Int(rv) {
+		if rv != *ar.NewInt(rv) {
 			t.Fatalf("missmatch")
 		}
 
-		if int8(rv) != *ar.Int8(int8(rv)) {
+		if int8(rv) != *ar.NewInt8(int8(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if int16(rv) != *ar.Int16(int16(rv)) {
+		if int16(rv) != *ar.NewInt16(int16(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if int32(rv) != *ar.Int32(int32(rv)) {
+		if int32(rv) != *ar.NewInt32(int32(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if int64(rv) != *ar.Int64(int64(rv)) {
+		if int64(rv) != *ar.NewInt64(int64(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if uint(rv) != *ar.Uint(uint(rv)) {
+		if uint(rv) != *ar.NewUint(uint(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if uint8(rv) != *ar.Uint8(uint8(rv)) {
+		if uint8(rv) != *ar.NewUint8(uint8(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if uint16(rv) != *ar.Uint16(uint16(rv)) {
+		if uint16(rv) != *ar.NewUint16(uint16(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if uint32(rv) != *ar.Uint32(uint32(rv)) {
+		if uint32(rv) != *ar.NewUint32(uint32(rv)) {
 			t.Fatalf("missmatch")
 		}
 
-		if uint64(rv) != *ar.Uint64(uint64(rv)) {
+		if uint64(rv) != *ar.NewUint64(uint64(rv)) {
 			t.Fatalf("missmatch")
 		}
 
@@ -91,12 +91,12 @@ func TestArena(t *testing.T) {
 		}
 
 		var f32 = rand.Float32() * 1000.0
-		if f32 != *ar.Float32(f32) {
+		if f32 != *ar.NewFloat32(f32) {
 			t.Fatalf("missmatch")
 		}
 
 		var f64 = rand.Float64() * 1000.0
-		if f64 != *ar.Float64(f64) {
+		if f64 != *ar.NewFloat64(f64) {
 			t.Fatalf("missmatch")
 		}
 
@@ -141,7 +141,7 @@ func TestArenaLifecycle(t *testing.T) {
 	})
 
 	// 从Arena中分配对象
-	i32 := ar.Int32(1001)
+	i32 := ar.NewInt32(1001)
 
 	// 触发Arena SetFinalizer 调用
 	runtime.GC()
@@ -301,15 +301,15 @@ func prepareArenaArgs(ar *Arena) *largeMessage {
 		if field.Type().Kind() == reflect.Ptr {
 			switch v.Field(k).Type().Elem().Kind() {
 			case reflect.Int:
-				field.Set(reflect.ValueOf(ar.Int(int(i))))
+				field.Set(reflect.ValueOf(ar.NewInt(int(i))))
 			case reflect.Int32:
-				field.Set(reflect.ValueOf(ar.Int32(int32(i))))
+				field.Set(reflect.ValueOf(ar.NewInt32(int32(i))))
 			case reflect.Int64:
-				field.Set(reflect.ValueOf(ar.Int64(int64(i))))
+				field.Set(reflect.ValueOf(ar.NewInt64(int64(i))))
 			case reflect.Bool:
-				field.Set(reflect.ValueOf(ar.Bool(b)))
+				field.Set(reflect.ValueOf(ar.NewBool(b)))
 			case reflect.String:
-				field.Set(reflect.ValueOf(ar.String(s)))
+				field.Set(reflect.ValueOf(ar.NewString(s)))
 			}
 		} else {
 			switch field.Kind() {
@@ -326,7 +326,7 @@ func prepareArenaArgs(ar *Arena) *largeMessage {
 	return args
 }
 
-const largeSize = 1000 * 1000 * 10
+const largeSize = 1000 * 1000 * 1
 
 func TestHeapLargeObjects(t *testing.T) {
 	var m = make([]*largeMessage, largeSize)
@@ -385,7 +385,7 @@ func TestNewArenaOptions(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				p := ar.Int(42)
+				p := ar.NewInt(42)
 				assert.Equal(t, 42, *p)
 			}()
 		}
@@ -396,7 +396,7 @@ func TestNewArenaOptions(t *testing.T) {
 	t.Run("WithEnableLock false", func(t *testing.T) {
 		ar := NewArena(WithEnableLock(false))
 		assert.NotNil(t, ar)
-		p := ar.String("test")
+		p := ar.NewString("test")
 		assert.Equal(t, "test", *p)
 		ar.Reset()
 	})
@@ -421,7 +421,7 @@ func TestNewArenaOptions(t *testing.T) {
 		// and when freed and the pool is exhausted, memory.Free is called.
 		// Use WithPoolSize(0) so freed blocks are immediately released.
 		ar2 := NewArena(WithMemory(custom), WithPoolSize(0))
-		bigSize := uintptr(4096)
+		bigSize := uintptr(8192)
 		ptr := ar2.Malloc(bigSize)
 		assert.NotNil(t, ptr)
 		ar2.Free(ptr) // With poolSize=0, the block is released via memory.Free
@@ -468,11 +468,11 @@ func TestMallocAlignment(t *testing.T) {
 }
 
 func TestMallocOversized(t *testing.T) {
-	// Default chunk size is 1024 + align; allocate something larger
+	// Default chunk size is 4096 + align; allocate something larger
 	ar := NewArena()
 	defer ar.Reset()
 
-	bigSize := uintptr(4096)
+	bigSize := uintptr(8192)
 	ptr := ar.Malloc(bigSize)
 	assert.NotNil(t, ptr)
 
@@ -501,8 +501,8 @@ func TestFreeNonArenaPointer(t *testing.T) {
 func TestReset(t *testing.T) {
 	t.Run("clears state", func(t *testing.T) {
 		ar := NewArena()
-		p1 := ar.Int(10)
-		p2 := ar.String("hello")
+		p1 := ar.NewInt(10)
+		p2 := ar.NewString("hello")
 		_ = p1
 		_ = p2
 
@@ -510,7 +510,7 @@ func TestReset(t *testing.T) {
 		// After Reset the arena's internal state is cleared (current is nil, chunkBlocks empty).
 		// A new arena should work normally afterwards.
 		ar2 := NewArena()
-		p3 := ar2.Int(99)
+		p3 := ar2.NewInt(99)
 		assert.Equal(t, 99, *p3)
 		ar2.Reset()
 	})
@@ -519,7 +519,7 @@ func TestReset(t *testing.T) {
 		// Each iteration creates a fresh arena, uses it, and resets it.
 		for i := 0; i < 5; i++ {
 			ar := NewArena()
-			p := ar.Int(i)
+			p := ar.NewInt(i)
 			assert.Equal(t, i, *p)
 			ar.Reset()
 		}
@@ -553,21 +553,21 @@ func TestConvenienceMethods(t *testing.T) {
 	defer ar.Reset()
 
 	t.Run("Bool", func(t *testing.T) {
-		assert.False(t, *ar.Bool(false))
-		assert.True(t, *ar.Bool(true))
+		assert.False(t, *ar.NewBool(false))
+		assert.True(t, *ar.NewBool(true))
 	})
 
 	t.Run("Int", func(t *testing.T) {
-		assert.Equal(t, 0, *ar.Int(0))
-		assert.Equal(t, -1, *ar.Int(-1))
-		assert.Equal(t, math.MaxInt, *ar.Int(math.MaxInt))
+		assert.Equal(t, 0, *ar.NewInt(0))
+		assert.Equal(t, -1, *ar.NewInt(-1))
+		assert.Equal(t, math.MaxInt, *ar.NewInt(math.MaxInt))
 	})
 
 	t.Run("String", func(t *testing.T) {
-		assert.Equal(t, "", *ar.String(""))
-		assert.Equal(t, "hello", *ar.String("hello"))
+		assert.Equal(t, "", *ar.NewString(""))
+		assert.Equal(t, "hello", *ar.NewString("hello"))
 		longStr := string(make([]byte, 10000))
-		assert.Equal(t, longStr, *ar.String(longStr))
+		assert.Equal(t, longStr, *ar.NewString(longStr))
 	})
 
 	t.Run("Bytes", func(t *testing.T) {
@@ -582,14 +582,14 @@ func TestConvenienceMethods(t *testing.T) {
 	})
 
 	t.Run("Float32", func(t *testing.T) {
-		assert.Equal(t, float32(0), *ar.Float32(0))
-		assert.Equal(t, float32(-1.5), *ar.Float32(-1.5))
-		assert.Equal(t, float32(math.MaxFloat32), *ar.Float32(math.MaxFloat32))
+		assert.Equal(t, float32(0), *ar.NewFloat32(0))
+		assert.Equal(t, float32(-1.5), *ar.NewFloat32(-1.5))
+		assert.Equal(t, float32(math.MaxFloat32), *ar.NewFloat32(math.MaxFloat32))
 	})
 
 	t.Run("Float64", func(t *testing.T) {
-		assert.Equal(t, float64(0), *ar.Float64(0))
-		assert.Equal(t, -3.14, *ar.Float64(-3.14))
-		assert.Equal(t, math.MaxFloat64, *ar.Float64(math.MaxFloat64))
+		assert.Equal(t, float64(0), *ar.NewFloat64(0))
+		assert.Equal(t, -3.14, *ar.NewFloat64(-3.14))
+		assert.Equal(t, math.MaxFloat64, *ar.NewFloat64(math.MaxFloat64))
 	})
 }

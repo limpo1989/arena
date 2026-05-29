@@ -64,6 +64,12 @@ func WithPoolSize(poolSize int) Option {
 // WithEnableLock enables thread-safe operation using a spinlock.
 // Required when the Arena is accessed concurrently.
 // When enabled, adds ~5-15ns overhead per allocation.
+//
+// NOTE: This lock protects ONLY the Arena allocator's internal state
+// (chunk management, freelist, refcounts). It does NOT protect the
+// contents of Map or Vector containers allocated from this Arena.
+// Concurrent access to individual Map/Vector instances requires
+// external synchronization (e.g., sync.Mutex).
 func WithEnableLock(enableLock bool) Option {
 	return func(o *arenaOptions) {
 		if enableLock {
@@ -91,9 +97,15 @@ type Memory interface {
 
 // Arena manages memory chunks and provides allocation services with reduced GC overhead.
 // It maintains reusable memory blocks and handles alignment automatically.
+//
+// Locking: the internal lock (if enabled via WithEnableLock) protects only the
+// allocator's chunk/freelist/refcount state. Map and Vector containers are NOT
+// protected by this lock — concurrent access to individual container instances
+// requires external synchronization.
 type Arena struct {
 	_           [0]sync.Mutex // NoCopy
 	locker      sync.Locker
+	useLock     bool // true if locker is a real lock (not nopLocker)
 	memory      Memory
 	chunkSize   uintptr
 	minHoleSize uintptr
@@ -106,9 +118,16 @@ type Arena struct {
 
 // NewArena creates a new Arena instance with customizable options.
 // Options can configure chunk size, memory pool size, locking behavior, and memory source.
+//
+// IMPORTANT: The caller must keep the Arena reachable by the GC (e.g., hold a
+// reference in a non-arena variable) for the entire lifetime of any objects
+// allocated from it. Arena-allocated objects store their *Arena reference
+// inside arena memory (backed by []byte), which the GC does not scan. If the
+// Arena becomes unreachable, the GC may collect it while arena objects are
+// still in use, causing undefined behavior.
 func NewArena(ops ...Option) *Arena {
 	var opts = arenaOptions{
-		chunkSize: 1024,
+		chunkSize: 4 * 1024,
 		poolSize:  64,
 		locker:    nopLocker{},
 		memory:    heapMemory{},
@@ -119,12 +138,14 @@ func NewArena(ops ...Option) *Arena {
 
 	ar := &Arena{}
 	ar.locker = opts.locker
+	_, ar.useLock = ar.locker.(nopLocker)
+	ar.useLock = !ar.useLock // true for real locks, false for nopLocker
 	ar.memory = opts.memory
 	ar.chunkSize = fixSize(max(512, opts.chunkSize)) + __align
 	ar.minHoleSize = fixSize(max(256, ar.chunkSize/5)) + __align
 	ar.poolSize = opts.poolSize
 	ar.current = ar.malloc(ar.chunkSize)
-	ar.chunkBlocks = make(map[uintptr]*chunkBlock, 8)
+	ar.chunkBlocks = make(map[uintptr]*chunkBlock, 32)
 	ar.visited = make(map[uintptr]struct{}, 128)
 	return ar
 }
@@ -132,8 +153,10 @@ func NewArena(ops ...Option) *Arena {
 // Reset clears all allocated chunks and resets the Arena to its initial state.
 // Existing pointers become invalid after this operation.
 func (ar *Arena) Reset() {
-	ar.locker.Lock()
-	defer ar.locker.Unlock()
+	if ar.useLock {
+		ar.locker.Lock()
+		defer ar.locker.Unlock()
+	}
 
 	for _, block := range ar.chunkBlocks {
 		ar.memory.Free(block.mem)
@@ -147,8 +170,10 @@ func (ar *Arena) Reset() {
 // Free releases a previously allocated memory block.
 // The pointer must belong to this Arena.
 func (ar *Arena) Free(ptrT any) {
-	ar.locker.Lock()
-	defer ar.locker.Unlock()
+	if ar.useLock {
+		ar.locker.Lock()
+		defer ar.locker.Unlock()
+	}
 
 	pVal := reflect.ValueOf(ptrT)
 
@@ -196,8 +221,10 @@ func (ar *Arena) Malloc(sz uintptr) unsafe.Pointer {
 		panic("malloc size must be positive")
 	}
 
-	ar.locker.Lock()
-	defer ar.locker.Unlock()
+	if ar.useLock {
+		ar.locker.Lock()
+		defer ar.locker.Unlock()
+	}
 
 	// 计算可用长度
 	availableBytes := uintptr(cap(ar.current.mem)) - ar.current.off
@@ -247,7 +274,7 @@ func (ar *Arena) malloc(sz uintptr) *chunkBlock {
 
 	m := ar.memory.Alloc(sz)
 	if nil == m || uintptr(cap(m)) < sz {
-		return nil
+		panic(fmt.Sprintf("OOM, failed to allocate memory of %d bytes", sz))
 	}
 	return &chunkBlock{off: 0, ref: 0, mem: m}
 }
@@ -278,103 +305,105 @@ func (ar *Arena) selectChunk(sz uintptr) *chunkBlock {
 	return selected
 }
 
-// Bool allocates a boolean in the Arena and initializes it with the given value.
-func (ar *Arena) Bool(v bool) *bool {
+// NewBool allocates a boolean in the Arena and initializes it with the given value.
+func (ar *Arena) NewBool(v bool) *bool {
 	p := New[bool](ar)
 	*p = v
 	return p
 }
 
-// Int allocates an integer in the Arena and initializes it with the given value.
-func (ar *Arena) Int(v int) *int {
+// NewInt allocates an integer in the Arena and initializes it with the given value.
+func (ar *Arena) NewInt(v int) *int {
 	p := New[int](ar)
 	*p = v
 	return p
 }
 
-// Uint allocates an uint in the Arena and initializes it with the given value.
-func (ar *Arena) Uint(v uint) *uint {
+// NewUint allocates an uint in the Arena and initializes it with the given value.
+func (ar *Arena) NewUint(v uint) *uint {
 	p := New[uint](ar)
 	*p = v
 	return p
 }
 
-// Int8 allocates an int8 in the Arena and initializes it with the given value.
-func (ar *Arena) Int8(v int8) *int8 {
+// NewInt8 allocates an int8 in the Arena and initializes it with the given value.
+func (ar *Arena) NewInt8(v int8) *int8 {
 	p := New[int8](ar)
 	*p = v
 	return p
 }
 
-// Uint8 allocates an uint8 in the Arena and initializes it with the given value.
-func (ar *Arena) Uint8(v uint8) *uint8 {
+// NewUint8 allocates an uint8 in the Arena and initializes it with the given value.
+func (ar *Arena) NewUint8(v uint8) *uint8 {
 	p := New[uint8](ar)
 	*p = v
 	return p
 }
 
-// Int16 allocates an int16 in the Arena and initializes it with the given value.
-func (ar *Arena) Int16(v int16) *int16 {
+// NewInt16 allocates an int16 in the Arena and initializes it with the given value.
+func (ar *Arena) NewInt16(v int16) *int16 {
 	p := New[int16](ar)
 	*p = v
 	return p
 }
 
-// Uint16 allocates an uint16 in the Arena and initializes it with the given value.
-func (ar *Arena) Uint16(v uint16) *uint16 {
+// NewUint16 allocates an uint16 in the Arena and initializes it with the given value.
+func (ar *Arena) NewUint16(v uint16) *uint16 {
 	p := New[uint16](ar)
 	*p = v
 	return p
 }
 
-// Int32 allocates an int32 in the Arena and initializes it with the given value.
-func (ar *Arena) Int32(v int32) *int32 {
+// NewInt32 allocates an int32 in the Arena and initializes it with the given value.
+func (ar *Arena) NewInt32(v int32) *int32 {
 	p := New[int32](ar)
 	*p = v
 	return p
 }
 
-// Uint32 allocates an uint32 in the Arena and initializes it with the given value.
-func (ar *Arena) Uint32(v uint32) *uint32 {
+// NewUint32 allocates an uint32 in the Arena and initializes it with the given value.
+func (ar *Arena) NewUint32(v uint32) *uint32 {
 	p := New[uint32](ar)
 	*p = v
 	return p
 }
 
-// Int64 allocates an int64 in the Arena and initializes it with the given value.
-func (ar *Arena) Int64(v int64) *int64 {
+// NewInt64 allocates an int64 in the Arena and initializes it with the given value.
+func (ar *Arena) NewInt64(v int64) *int64 {
 	p := New[int64](ar)
 	*p = v
 	return p
 }
 
-// Uint64 allocates an uint64 in the Arena and initializes it with the given value.
-func (ar *Arena) Uint64(v uint64) *uint64 {
+// NewUint64 allocates an uint64 in the Arena and initializes it with the given value.
+func (ar *Arena) NewUint64(v uint64) *uint64 {
 	p := New[uint64](ar)
 	*p = v
 	return p
 }
 
-// Float32 allocates an float32 in the Arena and initializes it with the given value.
-func (ar *Arena) Float32(v float32) *float32 {
+// NewFloat32 allocates an float32 in the Arena and initializes it with the given value.
+func (ar *Arena) NewFloat32(v float32) *float32 {
 	p := New[float32](ar)
 	*p = v
 	return p
 }
 
-// Float64 allocates an float64 in the Arena and initializes it with the given value.
-func (ar *Arena) Float64(v float64) *float64 {
+// NewFloat64 allocates an float64 in the Arena and initializes it with the given value.
+func (ar *Arena) NewFloat64(v float64) *float64 {
 	p := New[float64](ar)
 	*p = v
 	return p
 }
 
-// String allocates and initializes a string in the Arena by copying the input.
-func (ar *Arena) String(v string) (s *string) {
+// NewString allocates a string header and data in the Arena, returning *string.
+func (ar *Arena) NewString(v string) (s *string) {
 	return DeepCopy(ar, v)
 }
 
-// Bytes allocates a byte slice in the Arena and copies the input data.
+// Bytes allocates a byte slice's backing array in the Arena and copies the input data.
+// The slice header is returned by value (on stack), not allocated in arena.
+// Only the backing data is arena-managed.
 func (ar *Arena) Bytes(v []byte) (b []byte) {
 	// 分配内存
 	b = NewSlice[byte](ar, len(v), cap(v))
@@ -400,6 +429,31 @@ func (ar *Arena) isManaged(ptr uintptr) bool {
 	return false
 }
 
+// IsManagedPointer reports whether the given pointer points into memory managed by this Arena.
+func (ar *Arena) IsManagedPointer(ptr unsafe.Pointer) bool {
+	if !ar.useLock {
+		return ar.isManaged(uintptr(ptr))
+	}
+	ar.locker.Lock()
+	ok := ar.isManaged(uintptr(ptr))
+	ar.locker.Unlock()
+	return ok
+}
+
+// String copies a string's data pointers into the arena and returns a string
+// whose header can be inlined in a struct field. Only the string data is
+// allocated in arena — no separate header allocation — so there is no
+// orphaned pointer. Use NewString if you need *string.
+func (ar *Arena) String(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	n := uintptr(len(s))
+	p := ar.Malloc(n)
+	copy(unsafe.Slice((*byte)(p), n), s)
+	return unsafe.String((*byte)(p), len(s))
+}
+
 func isArenaManagedSlice[T any](ar *Arena, s []T) bool {
 	// 获取底层数组指针
 	dataPtr := uintptr(unsafe.Pointer(unsafe.SliceData(s)))
@@ -409,11 +463,36 @@ func isArenaManagedSlice[T any](ar *Arena, s []T) bool {
 // DeepCopy allocates an object of type T from the Arena and performs a deep copy of the source object v into it.
 // The underlying memory is managed by the Arena.
 func DeepCopy[T any](ar *Arena, v T) *T {
-	validateType[T]()
-	p := New[T](ar)
+	info := getTypeInfo[T]()
+	p := (*T)(ar.Malloc(sizeOf[T]()))
+
+	// Flat fast path: pure-value types can be copied with a single assignment.
+	if info.flat {
+		*p = v
+		return p
+	}
+
+	// Try copy plan path for non-flat types
+	t := reflect.TypeFor[T]()
+	if t.Kind() == reflect.Struct || t.Kind() == reflect.Ptr {
+		plan := getOrBuildCopyPlan(t)
+		var visited map[uintptr]unsafe.Pointer
+		if plan.cyclic {
+			visited = make(map[uintptr]unsafe.Pointer, 32)
+		}
+		srcPtr := unsafe.Pointer(&v)
+		dstPtr := unsafe.Pointer(p)
+		executeCopyPlan(ar, plan, srcPtr, dstPtr, visited)
+		return p
+	}
+
+	// Fallback to reflect for non-struct/non-ptr types (e.g., interfaces)
 	src := reflect.ValueOf(v)
 	dst := reflect.ValueOf(p).Elem()
-	visited := make(map[uintptr]reflect.Value, 64)
+	var visited map[uintptr]unsafe.Pointer
+	if info.cyclic {
+		visited = make(map[uintptr]unsafe.Pointer, 32)
+	}
 	deepCopy(ar, src, dst, visited)
 	return p
 }
@@ -508,9 +587,41 @@ func deepCopySliceArena[T any](ar *Arena, dst []T, values []T) []T {
 	if n := cap(dst) - len(dst); n < len(values) {
 		panic(fmt.Errorf("no available capacity to copied: cap: %d, len: %d, avaliable: %d, required: %d", cap(dst), len(dst), n, len(values)))
 	}
-	visited := make(map[uintptr]reflect.Value, 64)
+	info := getTypeInfo[T]()
 	idx := len(dst)
 	newDst := dst[:idx+len(values)]
+
+	// Fastest path: flat types (int, bool, float, etc.) — memcpy-able, no deep copy needed.
+	if info.flat {
+		copy(newDst[idx:], values)
+		return newDst
+	}
+
+	// Fast path: copy plan for non-cyclic, non-arena-container types.
+	if !info.cyclic {
+		t := reflect.TypeFor[T]()
+		ct := t
+		if ct.Kind() == reflect.Ptr {
+			ct = ct.Elem()
+		}
+		if !isArenaContainerType(ct) {
+			plan := getOrBuildCopyPlan(t)
+			if len(plan.ops) > 0 {
+				for i := range values {
+					elemSrc := unsafe.Pointer(&values[i])
+					elemDst := unsafe.Pointer(&newDst[idx+i])
+					executeCopyPlan(ar, plan, elemSrc, elemDst, nil)
+				}
+				return newDst
+			}
+		}
+	}
+
+	// Fallback to reflect for cyclic types or arena containers
+	var visited map[uintptr]unsafe.Pointer
+	if info.cyclic {
+		visited = make(map[uintptr]unsafe.Pointer, 32)
+	}
 	for i := range values {
 		srcVal := reflect.ValueOf(values[i])
 		dstVal := reflect.ValueOf(&newDst[idx+i]).Elem()
@@ -528,7 +639,7 @@ type deepCopier interface {
 func deepCopy(
 	ar *Arena,
 	src, dst reflect.Value,
-	visited map[uintptr]reflect.Value,
+	visited map[uintptr]unsafe.Pointer,
 ) {
 	// Check for deepCopier interface (arena container types)
 	if src.CanInterface() {
@@ -556,13 +667,12 @@ func deepCopy(
 	}
 
 	// 处理循环引用
-	if src.Kind() == reflect.Ptr && src.CanAddr() {
+	if visited != nil && src.Kind() == reflect.Ptr && src.CanAddr() {
 		addr := src.Pointer()
 		if exist, ok := visited[addr]; ok {
-			dst.Set(exist)
+			dst.Set(reflect.NewAt(dst.Type().Elem(), exist))
 			return
 		}
-		visited[addr] = dst
 	}
 
 	switch src.Kind() {
@@ -574,6 +684,9 @@ func deepCopy(
 		// 创建新指针并递归拷贝
 		elemType := src.Type().Elem()
 		newPtr := ar.Malloc(elemType.Size())
+		if visited != nil {
+			visited[src.Pointer()] = newPtr
+		}
 		dst.Set(reflect.NewAt(elemType, newPtr))
 		deepCopy(ar, src.Elem(), dst.Elem(), visited)
 	case reflect.Array:
@@ -607,20 +720,23 @@ func deepCopy(
 	case reflect.String:
 		// 将字符串内容拷贝到Arena
 		str := src.String()
-		b := ar.Bytes([]byte(str))
-		dst.SetString(unsafe.String(unsafe.SliceData(b), len(b)))
+		if len(str) == 0 {
+			return
+		}
+		newPtr := ar.Malloc(uintptr(len(str)))
+		copy(unsafe.Slice((*byte)(newPtr), len(str)), str)
+		dst.SetString(unsafe.String((*byte)(newPtr), len(str)))
 
 	case reflect.Struct:
-		// 递归处理结构体字段
-		for i := 0; i < src.NumField(); i++ {
-			srcField := src.Field(i)
-			dstField := dst.Field(i)
-
-			deepCopy(ar,
-				srcField,
-				dstField,
-				visited,
-			)
+		if src.CanAddr() && dst.CanAddr() {
+			plan := getOrBuildCopyPlan(src.Type())
+			srcPtr := unsafe.Pointer(src.UnsafeAddr())
+			dstPtr := unsafe.Pointer(dst.UnsafeAddr())
+			executeCopyPlan(ar, plan, srcPtr, dstPtr, visited)
+		} else {
+			for i := 0; i < src.NumField(); i++ {
+				deepCopy(ar, src.Field(i), dst.Field(i), visited)
+			}
 		}
 
 	case reflect.Interface:
@@ -679,10 +795,19 @@ func deepFree(
 		// 释放自身
 		ar.freePointer(unsafe.Pointer(src.Pointer()))
 
+		// 清零指针，防止 GC 扫描到已释放的地址
+		if src.CanSet() {
+			src.SetZero()
+		}
+
 	case reflect.Struct:
 		for i := 0; i < src.NumField(); i++ {
 			field := src.Field(i)
 			deepFree(ar, field, visited)
+			// 清零指针类字段，防止 GC 在后续递归调用的 safepoint 扫描到悬空指针
+			if field.CanSet() {
+				field.SetZero()
+			}
 		}
 
 	case reflect.Slice:
@@ -692,7 +817,12 @@ func deepFree(
 
 		// 处理每个元素
 		for i := 0; i < src.Len(); i++ {
-			deepFree(ar, src.Index(i), visited)
+			elem := src.Index(i)
+			deepFree(ar, elem, visited)
+			// 清零元素，防止 GC 扫描到已释放的子分配
+			if elem.CanSet() {
+				elem.SetZero()
+			}
 		}
 
 		// 处理底层数组指针
@@ -700,7 +830,11 @@ func deepFree(
 
 	case reflect.Array:
 		for i := 0; i < src.Len(); i++ {
-			deepFree(ar, src.Index(i), visited)
+			elem := src.Index(i)
+			deepFree(ar, elem, visited)
+			if elem.CanSet() {
+				elem.SetZero()
+			}
 		}
 	case reflect.String:
 		// 处理底层数组指针

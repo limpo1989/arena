@@ -271,9 +271,9 @@ func TestVector_PointerElements(t *testing.T) {
 	vec := NewVector[*int](arena, 4)
 
 	// Allocate ints via arena and use their pointers as vector elements
-	p1 := arena.Int(10)
-	p2 := arena.Int(20)
-	p3 := arena.Int(30)
+	p1 := arena.NewInt(10)
+	p2 := arena.NewInt(20)
+	p3 := arena.NewInt(30)
 	vec.Append(p1, p2, p3)
 
 	assert.Equal(t, 3, vec.Len())

@@ -16,25 +16,34 @@
 package arena
 
 import (
+	"encoding/json"
 	"iter"
 	"reflect"
 )
 
 // Vector is an Arena-backed dynamic array providing type-safe operations.
 // It reduces GC pressure by storing elements in contiguous Arena memory.
+//
+// Vector is NOT thread-safe. Concurrent calls on the same Vector instance
+// require external synchronization (e.g., sync.Mutex). The Arena's internal
+// lock (if enabled) only protects the allocator, not the Vector's internal state.
 type Vector[T any] struct {
 	allocator *Arena
 	equatable func(a, b T) bool `arena:"safe"`
+	flat      bool
 	vec       []T
 }
 
 // NewVector creates a new Vector with specified initial capacity.
 // The vector's memory is managed by the provided Arena allocator.
+// The returned Vector is NOT thread-safe — use external synchronization
+// (e.g., sync.Mutex) for concurrent access.
 func NewVector[T any](allocator *Arena, capacity int) *Vector[T] {
 	validateType[T]()
 	v := New[Vector[T]](allocator)
 	v.allocator = allocator
 	v.equatable = deepEqual[T]
+	v.flat = getTypeInfo[T]().flat
 	v.vec = NewSlice[T](allocator, 0, capacity)
 	return v
 }
@@ -73,6 +82,13 @@ func (v *Vector[T]) All() iter.Seq2[int, T] {
 
 // Append adds elements to the end of the vector.
 func (v *Vector[T]) Append(values ...T) *Vector[T] {
+	// Fast path: flat type with available capacity — no allocator needed.
+	if v.flat && len(v.vec)+len(values) <= cap(v.vec) {
+		idx := len(v.vec)
+		v.vec = v.vec[:idx+len(values)]
+		copy(v.vec[idx:], values)
+		return v
+	}
 	v.vec = Append(v.allocator, v.vec, values...)
 	return v
 }
@@ -144,6 +160,27 @@ func (v *Vector[T]) LastIndex(value T) int {
 func (v *Vector[T]) Clear() {
 	v.allocator.Free(v.vec)
 	v.vec = nil
+}
+
+// MarshalJSON implements the json.Marshaler interface.
+// It serializes the Vector as a JSON array ([elem1, elem2, ...]).
+func (v *Vector[T]) MarshalJSON() ([]byte, error) {
+	return json.Marshal(v.vec)
+}
+
+// UnmarshalJSON implements the json.Unmarshaler interface.
+// It clears the Vector and populates it from a JSON array.
+// All data is deep-copied into arena memory.
+func (v *Vector[T]) UnmarshalJSON(data []byte) error {
+	v.Clear()
+	var tmp []T
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	for _, elem := range tmp {
+		v.Append(elem)
+	}
+	return nil
 }
 
 // arenaDeepCopy implements the deepCopier interface.

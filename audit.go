@@ -58,7 +58,7 @@ func (ar *Arena) AuditPointers(obj any) []PointerViolation {
 
 	violations := make([]PointerViolation, 0)
 	val := reflect.ValueOf(obj)
-	visited := make(map[uintptr]struct{}, 64)
+	visited := make(map[uintptr]struct{}, 32)
 	auditValue(ar, val, "", &violations, visited)
 	return violations
 }

@@ -390,6 +390,77 @@ func TestMapResize(t *testing.T) {
 	})
 }
 
+func TestMapResizePreservesDeepData(t *testing.T) {
+	t.Run("string values survive resize", func(t *testing.T) {
+		a := NewArena()
+		defer a.Reset()
+		// Start with capacity 8, loadFactor=0.7 → resize at 6 entries
+		m := NewMap[int, string](a, 8)
+		for i := 0; i < 10; i++ {
+			m.Put(i, strconv.Itoa(i*111))
+		}
+		assert.Equal(t, 10, m.Len())
+		for i := 0; i < 10; i++ {
+			v, ok := m.Get(i)
+			assert.True(t, ok, "key %d should exist", i)
+			assert.Equal(t, strconv.Itoa(i*111), v, "key %d value mismatch", i)
+		}
+	})
+
+	t.Run("pointer values survive resize", func(t *testing.T) {
+		a := NewArena()
+		defer a.Reset()
+		m := NewMap[int, *int](a, 8)
+		for i := 0; i < 10; i++ {
+			m.Put(i, &i) // heap pointer, deep-copied to arena
+		}
+		assert.Equal(t, 10, m.Len())
+		for i := 0; i < 10; i++ {
+			v, ok := m.Get(i)
+			assert.True(t, ok, "key %d should exist", i)
+			assert.NotNil(t, v, "key %d pointer should not be nil", i)
+			assert.Equal(t, i, *v, "key %d value mismatch", i)
+		}
+	})
+
+	t.Run("string keys survive resize", func(t *testing.T) {
+		a := NewArena()
+		defer a.Reset()
+		m := NewMap[string, int](a, 8)
+		for i := 0; i < 10; i++ {
+			m.Put(strconv.Itoa(i), i*100)
+		}
+		assert.Equal(t, 10, m.Len())
+		for i := 0; i < 10; i++ {
+			v, ok := m.Get(strconv.Itoa(i))
+			assert.True(t, ok, "key %d should exist", i)
+			assert.Equal(t, i*100, v, "key %d value mismatch", i)
+		}
+	})
+
+	t.Run("struct with pointer fields survive resize", func(t *testing.T) {
+		type item struct {
+			Name  string
+			Value *int
+		}
+		a := NewArena()
+		defer a.Reset()
+		m := NewMap[int, item](a, 8)
+		for i := 0; i < 10; i++ {
+			val := i * 7
+			m.Put(i, item{Name: strconv.Itoa(i), Value: &val})
+		}
+		assert.Equal(t, 10, m.Len())
+		for i := 0; i < 10; i++ {
+			v, ok := m.Get(i)
+			assert.True(t, ok, "key %d should exist", i)
+			assert.Equal(t, strconv.Itoa(i), v.Name, "key %d name mismatch", i)
+			assert.NotNil(t, v.Value, "key %d value pointer should not be nil", i)
+			assert.Equal(t, i*7, *v.Value, "key %d value mismatch", i)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // TestMapDeepCopier
 // ---------------------------------------------------------------------------
@@ -462,6 +533,8 @@ func TestStdMap(t *testing.T) {
 	for i := 0; i < largeSize; i++ {
 		m[i] = prepareArgs()
 	}
+	runtime.GC()
+
 	start := time.Now()
 	runtime.GC()
 	var memStat runtime.MemStats
@@ -474,10 +547,12 @@ func TestArenaMap(t *testing.T) {
 	var allocator = NewArena(WithChunkSize(1024 * 1024))
 	defer allocator.Reset()
 
-	var m = NewMap[int, largeMessage](allocator, largeSize)
+	var m = NewMap[int, *largeMessage](allocator, largeSize)
 	for i := 0; i < largeSize; i++ {
-		m.Put(i, *prepareArgs())
+		m.Put(i, prepareArgs())
 	}
+	runtime.GC()
+
 	start := time.Now()
 	runtime.GC()
 	var memStat runtime.MemStats

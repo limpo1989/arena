@@ -66,12 +66,12 @@ Arena memory is allocated as raw `[]byte` slices. **Go GC does not scan arena me
 Arena object fields must be created through `DeepCopy` or arena APIs. Direct assignment may write a heap pointer into arena memory. Since GC cannot trace this reference, the heap target may be collected, producing a dangling pointer. This issue does not fail immediately — it causes random crashes at runtime and is extremely difficult to diagnose.
 
 ```
-❌ p.Field = &heapObj         // DANGEROUS: arena holds a heap pointer
+❌ p.Field = &heapObj          // DANGEROUS: arena holds a heap pointer
 ❌ p.Field = heapSlice         // DANGEROUS: backing array is on heap
 ❌ p.Field = &SomeType{}       // DANGEROUS: implicit heap allocation
 
 ✓ p.Field = DeepCopy(ar, val) // SAFE: value is copied into arena
-✓ p.Field = ar.Int(42)        // SAFE: created via arena API
+✓ p.Field = ar.NewInt(42)     // SAFE: created via arena API
 ✓ p.Field = New[T](ar)        // SAFE: allocated in arena
 ```
 
@@ -210,12 +210,14 @@ Arena reduces GC pauses by:
 2. Lifetime Control: Allocations are freed together via Reset().
 3. Reduced Fragmentation: Chunk reuse minimizes heap fragmentation.
 
-### Benchmark (vs. Go heap):
+### Benchmark (vs. Go heap)
 
-```
-TestHeapLargeObjects    Heap GC took time: 541ms, living objects: 25000697
-TestArenaLargeObjects   Arena GC took time: 12ms, living objects: 16443
-```
+Tested on **Apple M4 Pro**, allocating 1M `largeMessage` objects (40+ fields each):
+
+| Metric | Go Heap | Arena | Improvement |
+|--------|---------|-------|-------------|
+| GC Scan Time | 25.6ms | 2.7ms | **9.4x faster** |
+| Living Objects | 2,500,702 | 2,288 | **1,093x fewer** |
 
 ## License
 

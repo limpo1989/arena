@@ -48,7 +48,7 @@ func TestDeepFreePointer(t *testing.T) {
 	ar := NewArena()
 	defer ar.Reset()
 
-	p := ar.Int(42)
+	p := ar.NewInt(42)
 	refAfter := currentRefCount(ar)
 
 	ar.Free(p)
@@ -70,8 +70,8 @@ func TestDeepFreeStruct(t *testing.T) {
 	}
 
 	p := New[multiPtr](ar)
-	p.X = ar.Int32(10)
-	p.Y = ar.Float64(3.14)
+	p.X = ar.NewInt32(10)
+	p.Y = ar.NewFloat64(3.14)
 
 	// p itself is one allocation, plus X and Y are two more.
 	refBefore := currentRefCount(ar)
@@ -94,9 +94,9 @@ func TestDeepFreeSlice(t *testing.T) {
 
 	// Create a slice of pointers.
 	s := NewSlice[*int](ar, 3, 3)
-	s[0] = ar.Int(1)
-	s[1] = ar.Int(2)
-	s[2] = ar.Int(3)
+	s[0] = ar.NewInt(1)
+	s[1] = ar.NewInt(2)
+	s[2] = ar.NewInt(3)
 
 	refBefore := currentRefCount(ar)
 
@@ -114,7 +114,7 @@ func TestDeepFreeString(t *testing.T) {
 	ar := NewArena()
 	defer ar.Reset()
 
-	s := ar.String("hello arena copy")
+	s := ar.NewString("hello arena copy")
 	require.NotNil(t, s)
 	assert.Equal(t, "hello arena copy", *s)
 
@@ -165,9 +165,9 @@ func TestDeepFreeVerifyRefCount(t *testing.T) {
 	defer ar.Reset()
 
 	// Allocate several independent objects.
-	p1 := ar.Int(10)
-	p2 := ar.Int(20)
-	p3 := ar.Int(30)
+	p1 := ar.NewInt(10)
+	p2 := ar.NewInt(20)
+	p3 := ar.NewInt(30)
 
 	// Record ref count after all allocations.
 	refAll := currentRefCount(ar)
@@ -291,9 +291,9 @@ func TestDeepFreeArrayOfPointers(t *testing.T) {
 	}
 
 	p := New[withPtrArr](ar)
-	p.Ptrs[0] = ar.Int32(10)
-	p.Ptrs[1] = ar.Int32(20)
-	p.Ptrs[2] = ar.Int32(30)
+	p.Ptrs[0] = ar.NewInt32(10)
+	p.Ptrs[1] = ar.NewInt32(20)
+	p.Ptrs[2] = ar.NewInt32(30)
 
 	refBefore := currentRefCount(ar)
 	ar.Free(p)
@@ -313,7 +313,7 @@ func TestDeepFreeInterface(t *testing.T) {
 		Val any
 	}
 
-	v := ar.Int(42)
+	v := ar.NewInt(42)
 	p := New[ifaceWrap](ar)
 	p.Val = v // interface wrapping *int allocated in arena
 
@@ -382,7 +382,7 @@ func TestDeepFreeStringAfterDeepCopy(t *testing.T) {
 
 	// After freeing, the arena ref count should be reduced.
 	// The arena itself should still be functional for new allocations.
-	p := ar.Int(100)
+	p := ar.NewInt(100)
 	assert.Equal(t, 100, *p)
 	runtime.KeepAlive(p)
 }
@@ -435,7 +435,7 @@ func TestDeepFreeComplexNested(t *testing.T) {
 	}
 
 	root := New[branch](ar)
-	root.Name = *ar.String("root")
+	root.Name = *ar.NewString("root")
 
 	c1 := New[leaf](ar)
 	c1.Value = 10

@@ -7,6 +7,9 @@ import (
 
 type SpinLock int32
 
+// Lock acquires the spinlock using CAS with exponential backoff.
+// IMPORTANT: SpinLock is non-reentrant. Calling Lock twice from the same
+// goroutine without an intervening Unlock will deadlock.
 func (sl *SpinLock) Lock() {
 	var backoff = 1
 	const maxBackoff = 16

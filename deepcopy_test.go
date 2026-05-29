@@ -601,7 +601,159 @@ func TestDeepCopyReflectEdgeCases(t *testing.T) {
 		src := reflect.ValueOf(func() {})
 		dst := reflect.New(reflect.TypeOf(func() {})).Elem()
 		assert.Panics(t, func() {
-			deepCopy(ar, src, dst, make(map[uintptr]reflect.Value))
+			deepCopy(ar, src, dst, make(map[uintptr]unsafe.Pointer))
 		})
+	})
+}
+
+func TestDeepCopyAuditPointers(t *testing.T) {
+	ar := NewArena()
+	defer ar.Reset()
+
+	t.Run("string_struct", func(t *testing.T) {
+		src := stringStruct{Name: "hello world"}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for stringStruct deep copy")
+	})
+
+	t.Run("ptr_struct", func(t *testing.T) {
+		v := int32(42)
+		src := ptrStruct{Val: &v}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for ptrStruct deep copy")
+	})
+
+	t.Run("slice_int_struct", func(t *testing.T) {
+		src := sliceIntStruct{Items: []int32{1, 2, 3, 4, 5}}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for sliceIntStruct deep copy")
+	})
+
+	t.Run("slice_str_struct", func(t *testing.T) {
+		src := sliceStrStruct{Items: []string{"alpha", "beta", "gamma"}}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for sliceStrStruct deep copy")
+	})
+
+	t.Run("nested_struct", func(t *testing.T) {
+		tag := "inner-tag"
+		src := nestedL1{
+			Name:  "outer",
+			Child: &nestedL2{Value: 99, Tag: tag},
+		}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for nestedL1 deep copy")
+	})
+
+	t.Run("tree_struct", func(t *testing.T) {
+		src := treeL1{
+			Root: &treeL2{
+				Label: "root",
+				Left:  &treeL3{Label: "left", Value: 1},
+				Right: &treeL3{Label: "right", Value: 2},
+			},
+		}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for treeL1 deep copy")
+	})
+
+	t.Run("mixed_struct", func(t *testing.T) {
+		age := int32(25)
+		src := mixedStruct{
+			Name:   "test",
+			Age:    &age,
+			Tags:   []string{"go", "arena"},
+			Detail: &nestedL2{Value: 42, Tag: "detail"},
+		}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for mixedStruct deep copy")
+	})
+
+	t.Run("linked_list", func(t *testing.T) {
+		src := &linkedNode{Value: 1, Next: &linkedNode{Value: 2, Next: &linkedNode{Value: 3}}}
+		src.Next.Next.Next = src // circular
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for linked list deep copy")
+	})
+
+	t.Run("nil_fields", func(t *testing.T) {
+		type sparse struct {
+			Name string
+			Ptr  *int32
+			Data []int32
+		}
+		cp := DeepCopy(ar, sparse{})
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for struct with nil fields")
+	})
+
+	t.Run("array_field", func(t *testing.T) {
+		type arrWrap struct {
+			Data [4]string
+		}
+		src := arrWrap{Data: [4]string{"a", "b", "c", "d"}}
+		cp := DeepCopy(ar, src)
+		violations := ar.AuditPointers(cp)
+		assert.Empty(t, violations, "expected no pointer violations for struct with array field")
+	})
+}
+
+func TestMergeDirectOps(t *testing.T) {
+	t.Run("all_direct_contiguous", func(t *testing.T) {
+		// 20 consecutive int32 fields → should merge into 1 opDirect (size=80)
+		ops := make([]copyOp, 20)
+		for i := range ops {
+			ops[i] = copyOp{kind: opDirect, offset: uintptr(i) * 4, size: 4}
+		}
+		merged := mergeDirectOps(ops)
+		assert.Equal(t, 1, len(merged))
+		assert.Equal(t, opDirect, merged[0].kind)
+		assert.Equal(t, uintptr(0), merged[0].offset)
+		assert.Equal(t, uintptr(80), merged[0].size)
+	})
+
+	t.Run("direct_separated_by_ptr", func(t *testing.T) {
+		// [int32, int32, *int64, int32, int32] → 3 ops: merged(8), opPtr, merged(8)
+		ops := []copyOp{
+			{kind: opDirect, offset: 0, size: 4},
+			{kind: opDirect, offset: 4, size: 4},
+			{kind: opPtr, offset: 8, size: 8},
+			{kind: opDirect, offset: 16, size: 4},
+			{kind: opDirect, offset: 20, size: 4},
+		}
+		merged := mergeDirectOps(ops)
+		assert.Equal(t, 3, len(merged))
+		assert.Equal(t, opDirect, merged[0].kind)
+		assert.Equal(t, uintptr(0), merged[0].offset)
+		assert.Equal(t, uintptr(8), merged[0].size)
+		assert.Equal(t, opPtr, merged[1].kind)
+		assert.Equal(t, opDirect, merged[2].kind)
+		assert.Equal(t, uintptr(16), merged[2].offset)
+		assert.Equal(t, uintptr(8), merged[2].size)
+	})
+
+	t.Run("no_direct_ops", func(t *testing.T) {
+		ops := []copyOp{
+			{kind: opString, offset: 0},
+			{kind: opPtr, offset: 16, size: 8},
+		}
+		merged := mergeDirectOps(ops)
+		assert.Equal(t, 2, len(merged))
+	})
+
+	t.Run("wide_struct_real_plan", func(t *testing.T) {
+		rt := reflect.TypeFor[wideStruct]()
+		plan := getOrBuildCopyPlan(rt)
+		assert.Equal(t, 1, len(plan.ops), "wideStruct should have exactly 1 merged opDirect")
+		assert.Equal(t, opDirect, plan.ops[0].kind)
+		assert.Equal(t, uintptr(80), plan.ops[0].size) // 20 × int32 = 80 bytes
 	})
 }

@@ -63,6 +63,7 @@ func BenchmarkMapPutIntInt(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			m.Put(i, i)
 		}
+		runtime.KeepAlive(ar)
 	})
 
 	b.Run("GoMap", func(b *testing.B) {
@@ -87,6 +88,7 @@ func BenchmarkMapGetIntInt(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = m.Get(i % mapSize)
 	}
+	runtime.KeepAlive(ar)
 }
 
 func BenchmarkGoMapGetIntInt(b *testing.B) {
@@ -116,6 +118,7 @@ func BenchmarkMapPutRemoveIntInt(b *testing.B) {
 				m.Remove(k)
 			}
 		}
+		runtime.KeepAlive(ar)
 	})
 
 	b.Run("GoMap", func(b *testing.B) {
@@ -145,6 +148,7 @@ func BenchmarkMapIterIntInt(b *testing.B) {
 		for range m.All() {
 		}
 	}
+	runtime.KeepAlive(ar)
 }
 
 func BenchmarkGoMapIterIntInt(b *testing.B) {
@@ -174,6 +178,7 @@ func BenchmarkMapPutIntString(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			m.Put(i, strconv.Itoa(i%1000))
 		}
+		runtime.KeepAlive(ar)
 	})
 
 	b.Run("GoMap", func(b *testing.B) {
@@ -198,6 +203,7 @@ func BenchmarkMapGetIntString(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = m.Get(i % mapSize)
 	}
+	runtime.KeepAlive(ar)
 }
 
 func BenchmarkGoMapGetIntString(b *testing.B) {
@@ -225,6 +231,7 @@ func BenchmarkVectorAppendInt(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		vec.Append(i)
 	}
+	runtime.KeepAlive(ar)
 }
 
 func BenchmarkGoSliceAppendInt(b *testing.B) {
@@ -244,6 +251,7 @@ func BenchmarkVectorAppendString(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		vec.Append(strconv.Itoa(i % 1000))
 	}
+	runtime.KeepAlive(ar)
 }
 
 func BenchmarkGoSliceAppendString(b *testing.B) {
@@ -272,6 +280,7 @@ func BenchmarkVectorIterInt(b *testing.B) {
 		for range vec.All() {
 		}
 	}
+	runtime.KeepAlive(ar)
 }
 
 func BenchmarkGoSliceIterInt(b *testing.B) {
@@ -328,6 +337,7 @@ func BenchmarkDeepCopyStruct(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			_ = DeepCopy(ar, src)
 		}
+		runtime.KeepAlive(ar)
 	})
 
 	b.Run("GoHeapCopy", func(b *testing.B) {
@@ -374,6 +384,7 @@ func BenchmarkGCScanCost(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				runtime.GC()
 			}
+			runtime.KeepAlive(ar)
 		})
 
 		b.Run(fmt.Sprintf("GoHeap_%d", n), func(b *testing.B) {
@@ -405,6 +416,7 @@ func BenchmarkGCSweepWithMap(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			runtime.GC()
 		}
+		runtime.KeepAlive(ar)
 	})
 
 	b.Run("GoMap_GC", func(b *testing.B) {
@@ -434,6 +446,7 @@ func BenchmarkGCSweepWithVector(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			runtime.GC()
 		}
+		runtime.KeepAlive(ar)
 	})
 
 	b.Run("GoSlice_GC", func(b *testing.B) {
