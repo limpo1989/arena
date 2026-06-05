@@ -132,7 +132,7 @@ All pointers into arena memory become invalid after `Arena.Reset()`. Using them 
      │                       │                        │
      ▼                       ▼                        ▼
   ┌──────┐             ┌──────────┐            ┌──────────────┐
-  │ Init │──▶ ... ──── │ Normal   │──▶ ... ──▶│ All pointers │
+  │ Init │──▶ ... ──── │ Normal   │──▶ ... ──▶ │ All pointers │
   │      │             │ usage    │            │ invalidated  │
   └──────┘             └──────────┘            └──────────────┘
 ```
@@ -185,7 +185,7 @@ m.Put("key", 42)
 v, ok := m.Get("key") 
 m.Remove("key")
 m.Len()
-for k, v := range m.Iter() { /* ... */ }
+for k, v := range m.All() { /* ... */ }
 m.Clear()
 ```
 
@@ -199,7 +199,7 @@ v.Remove(2)       // remove by value
 v.RemoveIdx(0)    // remove by index
 v.Index(3)        // find by value, returns -1 if not found
 v.Len(), v.Cap()
-for i, val := range v.Iter() { /* ... */ }
+for i, val := range v.All() { /* ... */ }
 v.Clear()
 ```
 
